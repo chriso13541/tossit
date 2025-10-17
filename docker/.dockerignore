@@ -1,0 +1,42 @@
+# Version control
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+env/
+
+# Data directories (mounted as volumes)
+data/
+storage/
+logs/
+debug_logs/
+backups/
+
+# Database files
+*.db
+*.sqlite
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+tests/
+test_*.py
+
+# Temporary files
+tmp/
+*.tmp
+*.log
+
+# Backups
+*.backup

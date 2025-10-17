@@ -1,0 +1,27 @@
+{
+  "brain": {
+    "ip_address": "0.0.0.0",
+    "port": 8000,
+    "database_path": "./tossit_brain.db",
+    "chunk_size_mb": 64,
+    "min_replicas": 2,
+    "max_replicas": 3,
+    "enable_web_ui": true
+  },
+  "node": {
+    "name": "my-node",
+    "storage_path": "./storage",
+    "port": 8080,
+    "brain_url": "http://192.168.1.100:8000",
+    "storage_mode": "percentage",
+    "storage_limit_percent": 50,
+    "storage_limit_gb": 100,
+    "auto_register": true
+  },
+  "cluster": {
+    "heartbeat_interval_seconds": 30,
+    "job_check_interval_seconds": 5,
+    "replication_priority": 7,
+    "verification_interval_hours": 24
+  }
+}

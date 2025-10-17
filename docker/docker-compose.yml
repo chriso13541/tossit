@@ -1,0 +1,142 @@
+# Docker Compose configuration for TossIt Cluster
+# Supports both single-machine and distributed deployments
+
+version: '3.8'
+
+services:
+  # Brain Server - Central coordinator
+  tossit-brain:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_TYPE: brain
+    image: tossit:latest
+    container_name: tossit-brain
+    hostname: tossit-brain
+    environment:
+      - TOSSIT_MODE=brain
+      - BRAIN_PORT=8000
+      - CHUNK_SIZE_MB=64
+      - MIN_REPLICAS=2
+      - MAX_REPLICAS=3
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/brain:/app/data
+      - ./logs/brain:/app/logs
+      - ./debug_logs/brain:/app/debug_logs
+    networks:
+      tossit-network:
+        ipv4_address: 172.20.0.10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Storage Node 1
+  tossit-node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_TYPE: node
+    image: tossit:latest
+    container_name: tossit-node1
+    hostname: tossit-node1
+    environment:
+      - TOSSIT_MODE=node
+      - NODE_NAME=node1
+      - NODE_PORT=8080
+      - BRAIN_URL=http://172.20.0.10:8000
+      - STORAGE_MODE=percentage
+      - STORAGE_PERCENT=75
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./data/node1:/app/storage
+      - ./logs/node1:/app/logs
+    networks:
+      tossit-network:
+        ipv4_address: 172.20.0.11
+    depends_on:
+      tossit-brain:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Storage Node 2
+  tossit-node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_TYPE: node
+    image: tossit:latest
+    container_name: tossit-node2
+    hostname: tossit-node2
+    environment:
+      - TOSSIT_MODE=node
+      - NODE_NAME=node2
+      - NODE_PORT=8080
+      - BRAIN_URL=http://172.20.0.10:8000
+      - STORAGE_MODE=percentage
+      - STORAGE_PERCENT=75
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./data/node2:/app/storage
+      - ./logs/node2:/app/logs
+    networks:
+      tossit-network:
+        ipv4_address: 172.20.0.12
+    depends_on:
+      tossit-brain:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Storage Node 3
+  tossit-node3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_TYPE: node
+    image: tossit:latest
+    container_name: tossit-node3
+    hostname: tossit-node3
+    environment:
+      - TOSSIT_MODE=node
+      - NODE_NAME=node3
+      - NODE_PORT=8080
+      - BRAIN_URL=http://172.20.0.10:8000
+      - STORAGE_MODE=percentage
+      - STORAGE_PERCENT=75
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./data/node3:/app/storage
+      - ./logs/node3:/app/logs
+    networks:
+      tossit-network:
+        ipv4_address: 172.20.0.13
+    depends_on:
+      tossit-brain:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  tossit-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+
+volumes:
+  brain-data:
+  node1-data:
+  node2-data:
+  node3-data:

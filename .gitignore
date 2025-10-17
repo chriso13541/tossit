@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# TossIt specific - DO NOT commit these
+data/
+storage/
+logs/
+debug_logs/
+backups/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+tossit_brain.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
+tmp/
+temp/
+
+# Config files with secrets (only example configs should be committed)
+config/*_config.json
+!config/config.example.json
+
+# Docker
+.env
+docker-compose.override.yml
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
