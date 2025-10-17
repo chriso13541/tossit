@@ -1,16 +1,12 @@
 # Docker Compose configuration for TossIt Cluster
-# Supports both single-machine and distributed deployments
-
 version: '3.8'
 
 services:
   # Brain Server - Central coordinator
   tossit-brain:
     build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        SERVICE_TYPE: brain
+      context: ..
+      dockerfile: docker/Dockerfile
     image: tossit:latest
     container_name: tossit-brain
     hostname: tossit-brain
@@ -40,10 +36,8 @@ services:
   # Storage Node 1
   tossit-node1:
     build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        SERVICE_TYPE: node
+      context: ..
+      dockerfile: docker/Dockerfile
     image: tossit:latest
     container_name: tossit-node1
     hostname: tossit-node1
@@ -70,10 +64,8 @@ services:
   # Storage Node 2
   tossit-node2:
     build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        SERVICE_TYPE: node
+      context: ..
+      dockerfile: docker/Dockerfile
     image: tossit:latest
     container_name: tossit-node2
     hostname: tossit-node2
@@ -100,10 +92,8 @@ services:
   # Storage Node 3
   tossit-node3:
     build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        SERVICE_TYPE: node
+      context: ..
+      dockerfile: docker/Dockerfile
     image: tossit:latest
     container_name: tossit-node3
     hostname: tossit-node3

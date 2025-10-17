@@ -1,28 +1,28 @@
 # docker-compose-simple.yml
-# Single-container setup for testing or small deployments
+# Single-container setup for testing
 
 version: '3.8'
 
 services:
   tossit:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     image: tossit:latest
     container_name: tossit-standalone
     hostname: tossit-standalone
     environment:
-      - TOSSIT_MODE=both          # Run brain + node in same container
+      - TOSSIT_MODE=both
       - BRAIN_PORT=8000
       - NODE_PORT=8081
       - CHUNK_SIZE_MB=64
-      - MIN_REPLICAS=1            # Single node = 1 replica only
+      - MIN_REPLICAS=1
       - MAX_REPLICAS=1
       - STORAGE_MODE=percentage
       - STORAGE_PERCENT=75
     ports:
-      - "8000:8000"               # Brain dashboard
-      - "8081:8081"               # Node API
+      - "8000:8000"
+      - "8081:8081"
     volumes:
       - ./data:/app/data
       - ./storage:/app/storage
@@ -35,6 +35,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-# For truly simple testing
-# docker run -d -p 8000:8000 -v $(pwd)/data:/app/data tossit:latest
