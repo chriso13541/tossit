@@ -1,5 +1,5 @@
 # Multi-stage build for TossIt Distributed Storage
-FROM python:3.11-slim as base
+FROM python:3.11-slim AS base
 
 # Set working directory
 WORKDIR /app
@@ -12,19 +12,19 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better layer caching
-COPY ../requirements.txt .
+COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy TossIt source code from src directory
-COPY ../src/*.py ./
+COPY src/*.py ./
 
 # Create necessary directories
 RUN mkdir -p /app/storage /app/logs /app/debug_logs /app/data /app/config
 
-# Copy entrypoint script
-COPY docker-entrypoint.sh /usr/local/bin/
+# Copy entrypoint script (now from docker/ subdirectory)
+COPY docker/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Set environment variables

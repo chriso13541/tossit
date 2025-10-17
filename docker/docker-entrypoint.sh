@@ -2,8 +2,6 @@
 set -e
 
 # TossIt Docker Entrypoint Script
-# Configures and starts brain or node based on environment variables
-
 echo "=========================================="
 echo "TossIt Container Starting"
 echo "=========================================="
@@ -74,7 +72,7 @@ wait_for_brain() {
     echo "Waiting for brain server at $brain_url..."
     
     while [ $attempt -le $max_attempts ]; do
-        if curl -s -f "${brain_url}/health" > /dev/null 2>&1; then
+        if curl -s -f "${brain_url}/api/nodes" > /dev/null 2>&1; then
             echo "✓ Brain server is ready!"
             return 0
         fi
@@ -121,27 +119,27 @@ case "${TOSSIT_MODE}" in
     both)
         echo "Starting as COMBINED (brain + node)..."
         
-        # Generate both configs
+        # Generate brain config
         generate_config "brain"
         
         # Start brain in background
         python3 brain_server.py &
         BRAIN_PID=$!
         
-        # Wait for brain to be ready
+        # Wait for brain to be ready on the actual interface
         sleep 5
-        if ! curl -s -f "http://localhost:8000/health" > /dev/null 2>&1; then
-            echo "Warning: Brain may not be fully ready"
-        fi
         
-        # Generate node config
+        # Get the container's IP address
+        CONTAINER_IP=$(hostname -i)
+        
+        # Generate node config with correct brain URL using container IP
         cat > /app/config/node_config.json << CONFIGEOF
 {
   "node": {
     "name": "$(hostname)-storage",
     "storage_path": "/app/storage",
     "port": ${NODE_PORT:-8081},
-    "brain_url": "http://localhost:8000",
+    "brain_url": "http://${CONTAINER_IP}:8000",
     "storage_mode": "${STORAGE_MODE:-percentage}",
     "storage_limit_percent": ${STORAGE_PERCENT:-60},
     "storage_limit_gb": ${STORAGE_GB:-100},
@@ -149,6 +147,9 @@ case "${TOSSIT_MODE}" in
   }
 }
 CONFIGEOF
+        
+        # Wait a bit more for brain to be fully ready
+        sleep 3
         
         # Start node agent in foreground
         exec python3 node_agent.py --config /app/config/node_config.json
