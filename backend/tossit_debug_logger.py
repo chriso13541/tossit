@@ -156,6 +156,9 @@ class UploadDebugLogger:
     
     def calculate_summary(self):
         """Calculate upload summary statistics"""
+        if not self.current_upload or "chunks" not in self.current_upload:
+            return  # Upload failed before chunks were created
+            
         chunks = self.current_upload["chunks"]
         nodes = self.current_upload["nodes_available"]
         

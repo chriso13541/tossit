@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TossIt - Distributed Storage Dashboard</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>TossIt Distributed Storage</h1>
+            <p class="subtitle">Peer-to-peer storage pooling across your network</p>
+            
+            <!-- Cluster ID Display -->
+            <div style="margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 4px; border: 1px solid rgba(255,255,255,0.5);">
+                <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+                    <div style="flex: 1; min-width: 200px;">
+                        <div style="font-size: 13px; color: #333; margin-bottom: 4px; font-weight: 500;">Cluster ID:</div>
+                        <div style="font-family: 'Courier New', monospace; font-size: 18px; font-weight: 600; color: #000;" id="clusterIdDisplay">Loading...</div>
+                    </div>
+                    <button onclick="copyClusterId()" class="btn btn-secondary" style="white-space: nowrap;">
+                        Copy Cluster ID
+                    </button>
+                    <button onclick="copyClusterUrl()" class="btn btn-primary" style="white-space: nowrap;">
+                        Copy Share URL
+                    </button>
+                </div>
+                <div id="copyStatus" style="margin-top: 8px; font-size: 13px; color: #28a745; display: none;">
+                    ✓ Copied to clipboard!
+                </div>
+            </div>
+        </header>
+
+        <!-- Tab Navigation -->
+        <nav class="tabs">
+            <button class="tab-button active" onclick="switchTab('dashboard')">
+                Dashboard
+            </button>
+            <button class="tab-button" onclick="switchTab('files')">
+                Files
+            </button>
+            <button class="tab-button" onclick="switchTab('nodes')">
+                Nodes
+            </button>
+            <button class="tab-button" onclick="switchTab('jobs')">
+                Jobs
+            </button>
+            <button class="tab-button" onclick="switchTab('settings')">
+                Settings
+            </button>
+            <button class="tab-button" onclick="switchTab('health')">
+                Health
+            </button>
+        </nav>
+
+        <!-- Dashboard Tab -->
+        <div id="dashboard" class="tab-content active">
+            <!-- Cluster Statistics -->
+            <section class="stats-grid" id="clusterStats">
+                <div class="stat-card">
+                    <div class="stat-value" id="totalNodes">-</div>
+                    <div class="stat-label">Online Nodes</div>
+                </div>
+                <div class="stat-card capacity-card">
+                    <div class="stat-value" id="usableCapacity">-</div>
+                    <div class="stat-label">Usable Capacity</div>
+                    <div class="stat-sublabel" id="rawCapacity">- raw</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="usedCapacity">-</div>
+                    <div class="stat-label">Used Space</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="totalFiles">-</div>
+                    <div class="stat-label">Files Stored</div>
+                </div>
+            </section>
+
+            <!-- Capacity Bar -->
+            <section class="card">
+                <h2>Storage Utilization</h2>
+                <div class="capacity-visualization">
+                    <div class="capacity-bar">
+                        <div id="capacityUsed" class="capacity-used" style="width: 0%">
+                            <span id="capacityPercentage">0%</span>
+                        </div>
+                    </div>
+                    <div class="capacity-legend">
+                        <span class="legend-item">
+                            <span class="legend-dot used"></span>
+                            Used: <span id="usedGB">0 GB</span>
+                        </span>
+                        <span class="legend-item">
+                            <span class="legend-dot free"></span>
+                            Free: <span id="freeGB">0 GB</span>
+                        </span>
+                        <span class="legend-item">
+                            <span class="legend-dot efficiency"></span>
+                            Efficiency: <span id="storageEfficiency">0%</span>
+                        </span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Recent Activity -->
+            <section class="card">
+                <h2>Recent Activity</h2>
+                <div id="recentActivity" class="activity-feed">
+                    <div class="activity-item">No recent activity</div>
+                </div>
+            </section>
+
+            <!-- Quick Stats -->
+            <section class="stats-grid secondary-stats">
+                <div class="stat-card small">
+                    <div class="stat-value" id="totalChunks">-</div>
+                    <div class="stat-label">Total Chunks</div>
+                </div>
+                <div class="stat-card small">
+                    <div class="stat-value" id="replicationFactor">-</div>
+                    <div class="stat-label">Avg Replication</div>
+                </div>
+                <div class="stat-card small">
+                    <div class="stat-value" id="activeJobs">-</div>
+                    <div class="stat-label">Active Jobs</div>
+                </div>
+                <div class="stat-card small">
+                    <div class="stat-value" id="systemHealth">-</div>
+                    <div class="stat-label">System Health</div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Files Tab -->
+        <div id="files" class="tab-content">
+            <!-- Upload Section -->
+            <section class="card">
+                <h2>Upload File</h2>
+                <div class="upload-form">
+                    <input type="file" id="fileInput" class="file-input">
+                    <button onclick="uploadFile()" class="btn btn-primary">Upload</button>
+                </div>
+                <div id="uploadProgress" class="progress-container" style="display: none;">
+                    <div class="progress-bar">
+                        <div id="progressBar" class="progress-fill"></div>
+                    </div>
+                    <div id="uploadStatus" class="status-text"></div>
+                </div>
+            </section>
+
+            <!-- Files List -->
+            <section class="card">
+                <div class="card-header">
+                    <h2>Stored Files</h2>
+                    <div class="search-box">
+                        <input type="text" id="fileSearch" placeholder="Search files..." onkeyup="filterFiles()">
+                    </div>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Filename</th>
+                                <th>Size</th>
+                                <th>Chunks</th>
+                                <th>Status</th>
+                                <th>Uploaded</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="filesTable">
+                            <tr><td colspan="6" class="text-center">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+
+        <!-- Nodes Tab -->
+        <div id="nodes" class="tab-content">
+            <section class="card">
+                <h2>Cluster Nodes</h2>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Status</th>
+                                <th>Total Capacity</th>
+                                <th>Free</th>
+                                <th>Utilization</th>
+                                <th>Priority</th>
+                                <th>Last Heartbeat</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="nodesTable">
+                            <tr><td colspan="8" class="text-center">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Node Details -->
+            <section class="card">
+                <h2>Node Performance</h2>
+                <div id="nodePerformance" class="performance-grid">
+                    <p class="text-muted">Select a node to view performance metrics</p>
+                </div>
+            </section>
+        </div>
+
+        <!-- Jobs Tab -->
+        <div id="jobs" class="tab-content">
+            <section class="card">
+                <h2>Background Jobs</h2>
+                <div class="jobs-status" id="jobsStatus">
+                    <div class="job-stat">
+                        <span class="job-label">Pending:</span>
+                        <span id="pendingJobs" class="job-value">-</span>
+                    </div>
+                    <div class="job-stat">
+                        <span class="job-label">In Progress:</span>
+                        <span id="inProgressJobs" class="job-value">-</span>
+                    </div>
+                    <div class="job-stat">
+                        <span class="job-label">Completed:</span>
+                        <span id="completedJobs" class="job-value">-</span>
+                    </div>
+                    <div class="job-stat">
+                        <span class="job-label">Failed:</span>
+                        <span id="failedJobs" class="job-value">-</span>
+                    </div>
+                </div>
+                <button onclick="cleanupJobs()" class="btn btn-secondary">Cleanup Old Jobs</button>
+            </section>
+
+            <!-- Job Queue -->
+            <section class="card">
+                <h2>Job Queue</h2>
+                <div id="jobQueue" class="job-list">
+                    <p class="text-muted">No active jobs</p>
+                </div>
+            </section>
+        </div>
+
+        <!-- Settings Tab -->
+        <div id="settings" class="tab-content">
+            <section class="card">
+                <h2>Cluster Settings</h2>
+                <div class="settings-form">
+                    <div class="form-group">
+                        <label for="chunk_size_mb">Chunk Size (MB):</label>
+                        <input type="number" id="chunk_size_mb" min="1" max="1024">
+                        <small>Size of each file chunk (1-1024 MB)</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="min_replicas">Minimum Replicas:</label>
+                        <input type="number" id="min_replicas" min="1" max="10">
+                        <small>Minimum copies of each chunk (affects usable capacity)</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="max_replicas">Maximum Replicas:</label>
+                        <input type="number" id="max_replicas" min="1" max="10">
+                        <small>Maximum copies of each chunk</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="replication_strategy">Replication Strategy:</label>
+                        <select id="replication_strategy">
+                            <option value="priority">Priority (best nodes first)</option>
+                            <option value="round_robin">Round Robin (spread evenly)</option>
+                            <option value="random">Random</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="redundancy_mode">Redundancy Mode:</label>
+                        <select id="redundancy_mode">
+                            <option value="minimal">Minimal (min replicas only)</option>
+                            <option value="standard">Standard (balanced)</option>
+                            <option value="high">High (max replicas)</option>
+                            <option value="paranoid">Paranoid (all nodes)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group checkbox-group">
+                        <label>
+                            <input type="checkbox" id="parallel_downloads">
+                            Enable Parallel Downloads
+                        </label>
+                    </div>
+
+                    <div class="form-group checkbox-group">
+                        <label>
+                            <input type="checkbox" id="verify_on_upload">
+                            Verify Checksums on Upload
+                        </label>
+                    </div>
+
+                    <button onclick="saveSettings()" class="btn btn-primary">Save Settings</button>
+                    <div id="settingsStatus" class="status-message"></div>
+                </div>
+            </section>
+
+            <!-- Storage Efficiency Info -->
+            <section class="card info-card">
+                <h3>Storage Efficiency</h3>
+                <p>With <strong id="currentReplicas">2</strong> replicas (RAID-1 style), your usable capacity is:</p>
+                <div class="formula-box">
+                    <code>Usable = Raw Capacity / Replica Count</code>
+                </div>
+                <p class="example">
+                    Example: 4 nodes × 50GB each = 200GB raw<br>
+                    With 2 replicas: 200GB / 2 = <strong>100GB usable</strong>
+                </p>
+            </section>
+        </div>
+
+        <!-- Health Tab -->
+        <div id="health" class="tab-content">
+            <section class="card">
+                <h2>System Health</h2>
+                <div class="health-status">
+                    <div class="health-indicator" id="healthIndicator">
+                        <div class="health-icon">?</div>
+                        <div class="health-text">Click "Run Validation" to check system health</div>
+                    </div>
+                    <button onclick="runHealthCheck()" class="btn btn-primary">Run ACID Validation</button>
+                </div>
+            </section>
+
+            <!-- Validation Results -->
+            <section class="card">
+                <h2>Validation Results</h2>
+                <div id="validationResults" class="validation-results">
+                    <p class="text-muted">No validation has been run yet</p>
+                </div>
+            </section>
+
+            <!-- Repair Tools -->
+            <section class="card">
+                <h2>Repair Tools</h2>
+                <div class="repair-tools">
+                    <button onclick="recalculateCapacity()" class="btn btn-secondary">
+                        Recalculate Node Capacity
+                    </button>
+                    <button onclick="fixIncompleteFiles()" class="btn btn-secondary">
+                        Fix Incomplete Files
+                    </button>
+                    <button onclick="cleanupOrphans()" class="btn btn-secondary">
+                        Cleanup Orphaned Records
+                    </button>
+                    <button onclick="cleanupStaleFiles()" class="btn btn-warning">
+                        Delete Stale Incomplete Files
+                    </button>
+                </div>
+                <div id="repairStatus" class="status-message"></div>
+            </section>
+
+            <!-- WAL Status -->
+            <section class="card">
+                <h2>Database Status</h2>
+                <div class="db-status" id="dbStatus">
+                    <p>WAL Mode: <span id="walMode" class="badge">Unknown</span></p>
+                    <p>Last Checkpoint: <span id="lastCheckpoint">-</span></p>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- File Details Modal -->
+    <div id="fileDetailsModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal()">&times;</span>
+            <h2>File Details</h2>
+            <div id="modalContent">Loading...</div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+    <script>
+        // Global variable to store cluster info
+        let clusterInfo = null;
+
+        // Fetch cluster info on page load
+        async function loadClusterInfo() {
+            try {
+                const response = await fetch('/api/cluster/info');
+                clusterInfo = await response.json();
+                document.getElementById('clusterIdDisplay').textContent = clusterInfo.cluster_id;
+            } catch (error) {
+                console.error('Failed to load cluster info:', error);
+                document.getElementById('clusterIdDisplay').textContent = 'Error loading';
+            }
+        }
+
+        // Copy cluster ID to clipboard
+        async function copyClusterId() {
+            if (!clusterInfo || !clusterInfo.cluster_id) {
+                alert('Cluster ID not loaded yet');
+                return;
+            }
+            
+            try {
+                await navigator.clipboard.writeText(clusterInfo.cluster_id);
+                showCopyStatus();
+            } catch (error) {
+                // Fallback for older browsers
+                const input = document.createElement('input');
+                input.value = clusterInfo.cluster_id;
+                document.body.appendChild(input);
+                input.select();
+                document.execCommand('copy');
+                document.body.removeChild(input);
+                showCopyStatus();
+            }
+        }
+
+        // Copy cluster share URL to clipboard
+        async function copyClusterUrl() {
+            if (!clusterInfo || !clusterInfo.cluster_id) {
+                alert('Cluster ID not loaded yet');
+                return;
+            }
+            
+            // Use tossit.cc if registry is enabled, otherwise use current host
+            const shareUrl = `http://tossit.cc/${clusterInfo.cluster_id}`;
+            
+            try {
+                await navigator.clipboard.writeText(shareUrl);
+                showCopyStatus('Share URL copied to clipboard!');
+            } catch (error) {
+                // Fallback for older browsers
+                const input = document.createElement('input');
+                input.value = shareUrl;
+                document.body.appendChild(input);
+                input.select();
+                document.execCommand('copy');
+                document.body.removeChild(input);
+                showCopyStatus('Share URL copied to clipboard!');
+            }
+        }
+
+        // Show copy status message
+        function showCopyStatus(message = '✓ Copied to clipboard!') {
+            const status = document.getElementById('copyStatus');
+            status.textContent = message;
+            status.style.display = 'block';
+            setTimeout(() => {
+                status.style.display = 'none';
+            }, 2000);
+        }
+
+        // Load cluster info when page loads
+        window.addEventListener('DOMContentLoaded', loadClusterInfo);
+    </script>
+</body>
+</html>

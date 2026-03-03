@@ -123,7 +123,7 @@ class Replica(Base):
     
     # Verification
     last_verified = Column(DateTime)
-    verification_status = Column(String(20), default="unverified")  # unverified, valid, corrupted
+    verification_status = Column(String(20), default="unverified")  # unverified, verified, corrupted
     
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow)
