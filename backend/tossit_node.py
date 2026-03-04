@@ -493,21 +493,22 @@ class TossItNode:
         """Called when health monitor detects a node is offline.
         
         IMPORTANT: We do NOT remove the node from Raft peers here.
-        Raft has its own leader detection via heartbeats and elections.
-        The health monitor's 20s timeout is too aggressive for heavy I/O
-        workloads where heartbeats are delayed but the node is alive.
         
-        Removing from Raft peers causes:
-        1. Pre-vote check can't find leader's IP → bypasses our safety check
-        2. Node wins election 1/1 (no peers) → spurious leadership change
-        3. Old leader steps down → 503 errors for queued uploads
-        
-        Instead, we only mark the node offline for UI and replication decisions.
-        Raft will detect actual failures through its own (longer) election timeout.
+        The health monitor pings peers via the main asyncio event loop,
+        which can be congested during heavy uploads. Before trusting the
+        offline verdict, we check Raft's heartbeat thread — which runs
+        independently and has its own direct communication with peers.
+        If the heartbeat thread has seen the peer recently, it's alive.
         """
+        # Check if the heartbeat thread (independent of event loop) has
+        # communicated with this peer recently. If so, the health monitor
+        # is wrong — its event-loop-based pings just couldn't get through.
+        if self.raft and self.raft.is_peer_alive(node_id, max_age=30.0):
+            return  # Heartbeat thread says peer is alive — ignore health monitor
+        
         if node_id in self.peer_nodes:
             node_info = self.peer_nodes[node_id]
-            print(f"💔 Node went offline: {node_info['node_name']} (health monitor timeout)")
+            print(f"💔 Node went offline: {node_info['node_name']} (health monitor timeout, confirmed by heartbeat thread)")
             print(f"   ℹ️  Raft peers unchanged — Raft handles leader detection independently")
             
             # Note: Keep in peer_nodes for now so UI can show offline status
@@ -2853,6 +2854,7 @@ class TossItNode:
         self.raft = ClusterRaft(
             node_id=self.node_id,  # Use cryptographic node ID
             node_name=self.config.node_name,
+            port=self.config.port,  # UDP heartbeat will use port+1
             identity=self.identity,  # Pass identity for signing messages
             trust_store=self.trust_store,  # Pass trust store for verification
             on_become_leader=self._on_became_leader,

@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-TossIt Cluster Raft - Leader Election with Dedicated Heartbeat Thread
-
-The heartbeat runs in its own OS thread, completely independent of the main
-asyncio event loop. This means upload I/O can NEVER starve heartbeats,
-which was the root cause of spurious elections under heavy load.
+TossIt Cluster Raft - Leader Election with UDP Heartbeats
 
 Architecture:
   Main thread (asyncio):  uploads, downloads, replication, API handlers
-  Heartbeat thread:       sends/monitors heartbeats, triggers elections
+  Heartbeat thread:       UDP send/recv + HTTP send, elections
 
-The two threads share state through simple attributes (thread-safe under
-Python's GIL for simple reads/writes). Async callbacks are dispatched to
-the main event loop via asyncio.run_coroutine_threadsafe().
+Heartbeats use TWO channels:
+  UDP (fast, timing):  Small datagram sent/received in heartbeat thread.
+                       Resets election timer. No event loop involvement.
+  HTTP (authoritative): Signed POST for Raft term/state transitions.
+                       Processed by FastAPI when event loop is free.
+
+The election timer ONLY checks the UDP channel. Since UDP send+recv both
+happen in the heartbeat thread, upload I/O can never cause false elections.
 """
 
 import asyncio
 import json
 import random
+import socket
+import struct
 import threading
 import time
 import urllib.request
@@ -32,18 +35,29 @@ class NodeState(Enum):
     LEADER = "leader"
 
 
+# UDP heartbeat packet format:
+#   4 bytes: magic (0x54495342 = "TISB")
+#   4 bytes: term (uint32)
+#   8 bytes: timestamp (double)
+#   remaining: node_id (utf-8 string)
+UDP_MAGIC = 0x54495342
+UDP_HEADER = struct.Struct('!Id')  # network byte order: uint32 + double
+
+
 class ClusterRaft:
     """
-    Raft leader election with a dedicated heartbeat thread.
+    Raft leader election with UDP heartbeats in a dedicated thread.
     
-    Key difference from standard asyncio Raft: heartbeats run in their own
-    OS thread, so they're never blocked by upload I/O saturating the event loop.
+    Both heartbeat sending AND receiving happen in their own OS thread
+    via raw UDP sockets. The main asyncio event loop is never involved
+    in timing-critical heartbeat detection.
     """
     
     def __init__(
         self,
         node_id: str,
         node_name: str,
+        port: int = 8000,
         identity=None,
         trust_store=None,
         on_become_leader: Optional[Callable] = None,
@@ -54,12 +68,14 @@ class ClusterRaft:
     ):
         self.node_id = node_id
         self.node_name = node_name
+        self.port = port
+        self.udp_port = port + 1  # UDP heartbeat port = HTTP port + 1
         
         # SECURITY
         self.identity = identity
         self.trust_store = trust_store
         
-        # Async callbacks (run in main event loop)
+        # Async callbacks (dispatched to main event loop)
         self.on_become_leader = on_become_leader
         self.on_lose_leadership = on_lose_leadership
         
@@ -69,13 +85,17 @@ class ClusterRaft:
         self.voted_for: Optional[str] = None
         self.leader_id: Optional[str] = None
         
-        # Known peers (node_id -> info dict)
+        # Known peers
         self.peers: Dict[str, dict] = {}
         
-        # Cached leader connection info (survives peer dict modifications)
+        # Cached leader info for pre-vote
         self.leader_peer_info: Optional[dict] = None
         
-        # Startup guard: don't auto-promote if peers ever existed
+        # Per-peer liveness — updated by heartbeat thread when a peer
+        # responds (HTTP 200) or sends us data (UDP). Used by the health
+        # monitor to avoid false "offline" marks during heavy I/O.
+        self.peer_last_seen: Dict[str, float] = {}
+        
         self._has_ever_had_peers = False
         
         # Timing
@@ -85,23 +105,31 @@ class ClusterRaft:
         self.heartbeat_interval = heartbeat_interval
         self.last_heartbeat = time.time()
         
+        # UDP socket (created in start())
+        self._udp_sock: Optional[socket.socket] = None
+        
         # Thread management
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self.running = False
         
-        print(f"🗳️  Raft initialized for {node_name} (timeout: {election_timeout_min}-{election_timeout_max}s, dedicated thread)")
+        print(f"🗳️  Raft initialized for {node_name} (timeout: {election_timeout_min}-{election_timeout_max}s, UDP port: {self.udp_port})")
     
     async def start(self):
-        """Start Raft consensus — launches dedicated heartbeat thread"""
+        """Start Raft — opens UDP socket and launches heartbeat thread"""
         self.running = True
         self.state = NodeState.FOLLOWER
         self.last_heartbeat = time.time()
-        
-        # Capture the main event loop so the thread can dispatch callbacks
         self._main_loop = asyncio.get_running_loop()
         
-        # Start the heartbeat thread (daemon so it dies with the process)
+        # Open UDP socket for heartbeats
+        self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._udp_sock.bind(('0.0.0.0', self.udp_port))
+        self._udp_sock.settimeout(1.0)  # 1s recv timeout for clean shutdown
+        print(f"   📡 UDP heartbeat socket bound to :{self.udp_port}")
+        
+        # Launch heartbeat thread
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_thread_run,
             name="raft-heartbeat",
@@ -109,13 +137,15 @@ class ClusterRaft:
         )
         self._heartbeat_thread.start()
         
-        print(f"✓ Raft started — heartbeat thread running independently of event loop")
+        print(f"✓ Raft started — heartbeat thread with UDP (fully independent of event loop)")
     
     async def stop(self):
-        """Stop Raft consensus"""
+        """Stop Raft"""
         self.running = False
         if self._heartbeat_thread:
             self._heartbeat_thread.join(timeout=5.0)
+        if self._udp_sock:
+            self._udp_sock.close()
         print("✓ Raft stopped")
     
     def update_peers(self, peers: Dict[str, dict]):
@@ -125,7 +155,6 @@ class ClusterRaft:
         if len(self.peers) > 0:
             self._has_ever_had_peers = True
         
-        # Auto-promote ONLY at startup with zero peers ever seen
         if (len(self.peers) == 0
                 and self.state != NodeState.LEADER
                 and not self._has_ever_had_peers):
@@ -134,19 +163,17 @@ class ClusterRaft:
                 asyncio.run_coroutine_threadsafe(self._become_leader(), self._main_loop)
     
     # ================================================================
-    #  HEARTBEAT THREAD — runs independently of asyncio event loop
+    #  HEARTBEAT THREAD — fully independent of asyncio event loop
     # ================================================================
     
     def _heartbeat_thread_run(self):
         """
-        Main loop for the dedicated heartbeat thread.
+        Dedicated heartbeat thread.
         
-        This thread handles both sides of the heartbeat protocol:
-        - Leader: sends heartbeats to all peers every N seconds
-        - Follower: monitors last_heartbeat and triggers elections if expired
+        Leader mode:  send UDP + HTTP heartbeats, sleep interval
+        Follower mode: recv UDP heartbeats, check election timeout
         
-        Uses synchronous urllib (not aiohttp) so it's completely independent
-        of the main asyncio event loop. Upload I/O cannot starve this thread.
+        Both send and receive use raw sockets / urllib — zero event loop.
         """
         print(f"   💓 Heartbeat thread started (interval={self.heartbeat_interval}s)")
         
@@ -156,8 +183,8 @@ class ClusterRaft:
                     self._thread_send_heartbeats()
                     time.sleep(self.heartbeat_interval)
                 else:
-                    # Follower/candidate: check election timeout
-                    time.sleep(1.0)
+                    # Follower: try to receive UDP heartbeats
+                    self._thread_recv_udp_heartbeats()
                     self._thread_check_election()
             except Exception as e:
                 print(f"⚠️  Heartbeat thread error: {e}")
@@ -166,10 +193,22 @@ class ClusterRaft:
         print(f"   💓 Heartbeat thread stopped")
     
     def _thread_send_heartbeats(self):
-        """Send heartbeats to all peers (runs in heartbeat thread)"""
+        """Send UDP + HTTP heartbeats to all peers (leader only)"""
         for node_id, peer_info in list(self.peers.items()):
+            peer_ip = peer_info['ip_address']
+            peer_port = peer_info['port']
+            peer_udp_port = peer_port + 1
+            
+            # --- UDP heartbeat (fast, timing-critical) ---
             try:
-                peer_url = f"http://{peer_info['ip_address']}:{peer_info['port']}/api/raft/heartbeat"
+                packet = self._build_udp_heartbeat()
+                self._udp_sock.sendto(packet, (peer_ip, peer_udp_port))
+            except Exception:
+                pass
+            
+            # --- HTTP heartbeat (authoritative, state-critical) ---
+            try:
+                peer_url = f"http://{peer_ip}:{peer_port}/api/raft/heartbeat"
                 
                 heartbeat_message = {
                     'leader_id': self.node_id,
@@ -178,7 +217,6 @@ class ClusterRaft:
                     'timestamp': time.time(),
                 }
                 
-                # Sign if identity available
                 if self.identity:
                     payload = self.identity.sign_json(heartbeat_message)
                 else:
@@ -186,73 +224,86 @@ class ClusterRaft:
                 
                 data = json.dumps(payload).encode('utf-8')
                 req = urllib.request.Request(
-                    peer_url,
-                    data=data,
+                    peer_url, data=data,
                     headers={'Content-Type': 'application/json'},
                     method='POST',
                 )
                 
                 with urllib.request.urlopen(req, timeout=3.0) as resp:
-                    pass  # 200 = acknowledged
-                    
+                    if resp.status == 200:
+                        # Peer confirmed alive — update liveness tracker
+                        self.peer_last_seen[node_id] = time.time()
             except Exception:
-                pass  # Peer unreachable — they'll timeout and trigger election
+                pass
         
         self.last_heartbeat = time.time()
     
+    def _thread_recv_udp_heartbeats(self):
+        """
+        Receive UDP heartbeats from leader (follower only).
+        
+        The socket has a 1s timeout, so this naturally paces the election
+        check loop without busy-waiting. When a heartbeat arrives, we
+        update last_heartbeat directly — no event loop.
+        """
+        try:
+            data, addr = self._udp_sock.recvfrom(1024)
+            
+            if len(data) < UDP_HEADER.size + 4:
+                return  # Runt packet
+            
+            # Parse header
+            magic_bytes = data[:4]
+            magic = struct.unpack('!I', magic_bytes)[0]
+            if magic != UDP_MAGIC:
+                return  # Not our packet
+            
+            term, ts = UDP_HEADER.unpack_from(data, 4)
+            sender_id = data[4 + UDP_HEADER.size:].decode('utf-8', errors='ignore')
+            
+            # Update heartbeat timestamp — this is the critical line that
+            # prevents elections. It runs in THIS thread, not the event loop.
+            self.last_heartbeat = time.time()
+            
+            # Track peer liveness
+            if sender_id:
+                self.peer_last_seen[sender_id] = time.time()
+            
+            # Update term if higher (leader changed while we were busy)
+            if term > self.current_term:
+                self.current_term = term
+                self.leader_id = sender_id
+                
+        except socket.timeout:
+            pass  # No UDP heartbeat received — election check will handle it
+        except Exception:
+            pass
+    
+    def _build_udp_heartbeat(self) -> bytes:
+        """Build a compact UDP heartbeat packet"""
+        magic = struct.pack('!I', UDP_MAGIC)
+        header = UDP_HEADER.pack(self.current_term, time.time())
+        node_id_bytes = self.node_id.encode('utf-8')
+        return magic + header + node_id_bytes
+    
     def _thread_check_election(self):
-        """Check if election timeout has expired (runs in heartbeat thread)"""
+        """Check election timeout (runs in heartbeat thread)"""
         elapsed = time.time() - self.last_heartbeat
         
         if elapsed <= self.election_timeout:
-            return  # Timer hasn't expired
+            return
         
-        # Timer expired — pre-vote: ping leader before disrupting the cluster
-        if self._thread_leader_is_reachable():
-            self.last_heartbeat = time.time()
-            return  # Leader alive, just slow on formal heartbeats
-        
-        # Leader genuinely unreachable — start election
-        print(f"⏰ Election timeout ({self.election_timeout:.1f}s) — leader unreachable, starting election")
+        # No UDP heartbeat for election_timeout seconds.
+        # Since UDP bypasses the event loop entirely, this means the leader
+        # is genuinely unreachable — not just busy with uploads.
+        print(f"⏰ Election timeout ({self.election_timeout:.1f}s) — no UDP heartbeat, starting election")
         self._thread_start_election()
         
-        # Reset
         self.election_timeout = random.uniform(self.election_timeout_min, self.election_timeout_max)
         self.last_heartbeat = time.time()
     
-    def _thread_leader_is_reachable(self) -> bool:
-        """
-        Pre-vote: ping the leader's lightweight /api/raft/ping endpoint.
-        
-        This endpoint does ZERO disk I/O (unlike /api/health which calls
-        _update_capacity). Returns 200 instantly even under max upload load.
-        Falls back to /api/health if ping isn't available.
-        """
-        if not self.leader_id:
-            return False
-        
-        peer_info = self.leader_peer_info
-        if not peer_info and self.leader_id in self.peers:
-            peer_info = self.peers[self.leader_id]
-        if not peer_info:
-            return False
-        
-        base = f"http://{peer_info['ip_address']}:{peer_info['port']}"
-        
-        # Try lightweight ping first, fall back to health
-        for endpoint in ["/api/raft/ping", "/api/health"]:
-            try:
-                req = urllib.request.Request(f"{base}{endpoint}", method='GET')
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    if resp.status == 200:
-                        return True
-            except Exception:
-                continue
-        
-        return False
-    
     def _thread_start_election(self):
-        """Run a leader election (from heartbeat thread)"""
+        """Run leader election (from heartbeat thread)"""
         self.state = NodeState.CANDIDATE
         self.current_term += 1
         self.voted_for = self.node_id
@@ -260,7 +311,7 @@ class ClusterRaft:
         
         print(f"📢 Starting election for term {self.current_term}")
         
-        votes_received = 1  # Self-vote
+        votes_received = 1
         
         for node_id, peer_info in list(self.peers.items()):
             try:
@@ -280,8 +331,7 @@ class ClusterRaft:
                 
                 data = json.dumps(payload).encode('utf-8')
                 req = urllib.request.Request(
-                    peer_url,
-                    data=data,
+                    peer_url, data=data,
                     headers={'Content-Type': 'application/json'},
                     method='POST',
                 )
@@ -298,7 +348,6 @@ class ClusterRaft:
         
         if votes_received > total_nodes / 2:
             print(f"✅ Won election with {votes_received}/{total_nodes} votes")
-            # Dispatch async callback to main event loop
             if self._main_loop and self._main_loop.is_running():
                 asyncio.run_coroutine_threadsafe(self._become_leader(), self._main_loop)
             else:
@@ -310,27 +359,21 @@ class ClusterRaft:
             self.last_heartbeat = time.time()
     
     # ================================================================
-    #  STATE TRANSITIONS — run in main event loop (for async callbacks)
+    #  STATE TRANSITIONS — dispatched to main event loop
     # ================================================================
     
     async def _become_leader(self):
-        """Transition to leader state"""
         was_leader = self.state == NodeState.LEADER
-        
         self.state = NodeState.LEADER
         self.leader_id = self.node_id
         
         if not was_leader:
             print(f"👑 Became leader for term {self.current_term}")
-            # Heartbeat sending is handled by the dedicated thread —
-            # no need to create an asyncio task for it.
             if self.on_become_leader:
                 await self.on_become_leader()
     
     async def _become_follower(self):
-        """Transition to follower state"""
         was_leader = self.state == NodeState.LEADER
-        
         self.state = NodeState.FOLLOWER
         self.last_heartbeat = time.time()
         
@@ -344,7 +387,13 @@ class ClusterRaft:
     # ================================================================
     
     async def receive_heartbeat(self, leader_id: str, term: int):
-        """Handle incoming heartbeat from leader"""
+        """
+        Handle incoming HTTP heartbeat from leader.
+        
+        This handles Raft state logic (term updates, step-downs).
+        The timing-critical last_heartbeat update is handled by UDP,
+        but we also update it here as defense-in-depth.
+        """
         if term > self.current_term:
             self.current_term = term
             self.voted_for = None
@@ -353,9 +402,8 @@ class ClusterRaft:
         
         if term == self.current_term:
             self.leader_id = leader_id
-            self.last_heartbeat = time.time()
+            self.last_heartbeat = time.time()  # Defense-in-depth
             
-            # Cache leader connection info for pre-vote checks
             if leader_id in self.peers:
                 self.leader_peer_info = self.peers[leader_id].copy()
             
@@ -364,7 +412,6 @@ class ClusterRaft:
                 await self._become_follower()
     
     async def request_vote(self, candidate_id: str, term: int) -> bool:
-        """Handle incoming vote request from candidate"""
         if term < self.current_term:
             return False
         
@@ -393,19 +440,32 @@ class ClusterRaft:
     
     def get_state(self) -> str:
         return self.state.value
+    
+    def is_peer_alive(self, node_id: str, max_age: float = 30.0) -> bool:
+        """
+        Check if a peer has been seen recently by the heartbeat thread.
+        
+        Used by the health monitor to avoid marking nodes offline when
+        the main event loop is too busy to process health check responses.
+        If the heartbeat thread has communicated with the peer recently,
+        the peer is definitely alive.
+        """
+        last_seen = self.peer_last_seen.get(node_id, 0)
+        return (time.time() - last_seen) < max_age
 
 
 # Example usage
 async def main():
     async def became_leader():
-        print("🎉 Callback: I am now the leader!")
+        print("🎉 I am now the leader!")
     
     async def lost_leadership():
-        print("😔 Callback: I am no longer the leader")
+        print("😔 I am no longer the leader")
     
     raft = ClusterRaft(
         node_id="node001",
         node_name="test-node",
+        port=8000,
         on_become_leader=became_leader,
         on_lose_leadership=lost_leadership,
     )
