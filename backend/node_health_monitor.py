@@ -44,14 +44,14 @@ class NodeHealthMonitor:
         """Start health monitoring"""
         self.running = True
         self.monitor_task = asyncio.create_task(self._monitor_loop())
-        print(f"💓 Health monitor started (timeout: {self.timeout_seconds}s)")
+        print(f"Health monitor started (timeout: {self.timeout_seconds}s)")
     
     async def stop(self):
         """Stop health monitoring"""
         self.running = False
         if self.monitor_task:
             self.monitor_task.cancel()
-        print("💓 Health monitor stopped")
+        print("Health monitor stopped")
     
     def update_peer(self, node_id: str):
         """Update last seen time for a peer"""
@@ -67,11 +67,11 @@ class NodeHealthMonitor:
         if is_new_peer:
             # New peer discovered - initialize as online
             self.peer_status[node_id] = "online"
-            print(f"💓 Heartbeat initialized for new peer: {node_id}")
+            print(f"Heartbeat initialized for new peer: {node_id}")
         elif self.peer_status.get(node_id) != "online":
             # Peer was offline, now back online
             self.peer_status[node_id] = "online"
-            print(f"✅ Peer {node_id} reconnected")
+            print(f"Peer {node_id} reconnected")
     
     def remove_peer(self, node_id: str):
         """Remove peer from monitoring"""
@@ -107,7 +107,7 @@ class NodeHealthMonitor:
                         if previous_status != "offline":
                             # Node just went offline
                             self.peer_status[node_id] = "offline"
-                            print(f"⚠️  Node {node_id} marked offline ({time_since_seen:.1f}s since last seen)")
+                            print(f"Node {node_id} marked offline ({time_since_seen:.1f}s since last seen)")
                             
                             # Callback
                             if self.on_node_offline:
@@ -116,7 +116,7 @@ class NodeHealthMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"⚠️  Health monitor error: {e}")
+                print(f"Health monitor error: {e}")
 
 
 # Example usage

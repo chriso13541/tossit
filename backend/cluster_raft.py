@@ -126,7 +126,7 @@ class ClusterRaft:
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self.running = False
         
-        print(f"🗳️  Raft initialized for {node_name} (term={self.current_term}, timeout: {election_timeout_min}-{election_timeout_max}s, UDP port: {self.udp_port})")
+        print(f"Raft initialized for {node_name} (term={self.current_term}, timeout: {election_timeout_min}-{election_timeout_max}s, UDP port: {self.udp_port})")
     
     async def start(self):
         """Start Raft — opens UDP socket and launches heartbeat thread"""
@@ -140,7 +140,7 @@ class ClusterRaft:
         self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._udp_sock.bind(('0.0.0.0', self.udp_port))
         self._udp_sock.settimeout(1.0)  # 1s recv timeout for clean shutdown
-        print(f"   📡 UDP heartbeat socket bound to :{self.udp_port}")
+        print(f"UDP heartbeat socket bound to :{self.udp_port}")
         
         # Launch heartbeat thread
         self._heartbeat_thread = threading.Thread(
@@ -171,7 +171,7 @@ class ClusterRaft:
         if (len(self.peers) == 0
                 and self.state != NodeState.LEADER
                 and not self._has_ever_had_peers):
-            print("📊 No peers at startup — becoming leader")
+            print("No peers at startup — becoming leader")
             if self._main_loop and self._main_loop.is_running():
                 asyncio.run_coroutine_threadsafe(self._become_leader(), self._main_loop)
     
@@ -205,7 +205,7 @@ class ClusterRaft:
             tmp.write_text(json.dumps(state))
             tmp.rename(self._state_file)
         except Exception as e:
-            print(f"⚠️  Failed to persist Raft state: {e}")
+            print(f"Failed to persist Raft state: {e}")
     
     def _load_persisted_state(self):
         """Load persisted term/vote from disk on startup."""
@@ -216,9 +216,9 @@ class ClusterRaft:
             state = json.loads(self._state_file.read_text())
             self.current_term = state.get("current_term", 0)
             self.voted_for = state.get("voted_for", None)
-            print(f"📂 Restored Raft state: term={self.current_term}, voted_for={self.voted_for}")
+            print(f"Restored Raft state: term={self.current_term}, voted_for={self.voted_for}")
         except Exception as e:
-            print(f"⚠️  Failed to load Raft state (starting fresh): {e}")
+            print(f"Failed to load Raft state (starting fresh): {e}")
     
     # ================================================================
     #  HEARTBEAT THREAD — fully independent of asyncio event loop
@@ -233,7 +233,7 @@ class ClusterRaft:
         
         Both send and receive use raw sockets / urllib — zero event loop.
         """
-        print(f"   💓 Heartbeat thread started (interval={self.heartbeat_interval}s)")
+        print(f"Heartbeat thread started (interval={self.heartbeat_interval}s)")
         
         while self.running:
             try:
@@ -245,10 +245,10 @@ class ClusterRaft:
                     self._thread_recv_udp_heartbeats()
                     self._thread_check_election()
             except Exception as e:
-                print(f"⚠️  Heartbeat thread error: {e}")
+                print(f"Heartbeat thread error: {e}")
                 time.sleep(1.0)
         
-        print(f"   💓 Heartbeat thread stopped")
+        print(f"Heartbeat thread stopped")
     
     def _thread_send_heartbeats(self):
         """Send UDP + HTTP heartbeats to all peers (leader only)"""
@@ -355,7 +355,7 @@ class ClusterRaft:
         # No UDP heartbeat for election_timeout seconds.
         # Since UDP bypasses the event loop entirely, this means the leader
         # is genuinely unreachable — not just busy with uploads.
-        print(f"⏰ Election timeout ({self.election_timeout:.1f}s) — no UDP heartbeat, starting election")
+        print(f"Election timeout ({self.election_timeout:.1f}s) — no UDP heartbeat, starting election")
         self._thread_start_election()
         
         self.election_timeout = random.uniform(self.election_timeout_min, self.election_timeout_max)
@@ -369,7 +369,7 @@ class ClusterRaft:
         self.leader_id = None
         self._persist_state()  # Persist before requesting votes
         
-        print(f"📢 Starting election for term {self.current_term}")
+        print(f"Starting election for term {self.current_term}")
         
         votes_received = 1
         
@@ -407,14 +407,14 @@ class ClusterRaft:
         total_nodes = 1 + len(self.peers)
         
         if votes_received > total_nodes / 2:
-            print(f"✅ Won election with {votes_received}/{total_nodes} votes")
+            print(f"Won election with {votes_received}/{total_nodes} votes")
             if self._main_loop and self._main_loop.is_running():
                 asyncio.run_coroutine_threadsafe(self._become_leader(), self._main_loop)
             else:
                 self.state = NodeState.LEADER
                 self.leader_id = self.node_id
         else:
-            print(f"❌ Lost election with {votes_received}/{total_nodes} votes")
+            print(f"Lost election with {votes_received}/{total_nodes} votes")
             self.state = NodeState.FOLLOWER
             self.last_heartbeat = time.time()
     
@@ -428,7 +428,7 @@ class ClusterRaft:
         self.leader_id = self.node_id
         
         if not was_leader:
-            print(f"👑 Became leader for term {self.current_term}")
+            print(f"Became leader for term {self.current_term}")
             if self.on_become_leader:
                 await self.on_become_leader()
     
@@ -438,7 +438,7 @@ class ClusterRaft:
         self.last_heartbeat = time.time()
         
         if was_leader:
-            print(f"📉 Stepped down as leader")
+            print(f"Stepped down as leader")
             if self.on_lose_leadership:
                 await self.on_lose_leadership()
     
@@ -469,7 +469,7 @@ class ClusterRaft:
                 self.leader_peer_info = self.peers[leader_id].copy()
             
             if self.state == NodeState.LEADER and leader_id != self.node_id:
-                print(f"⚠️  Another leader detected ({leader_id}), stepping down")
+                print(f"Another leader detected ({leader_id}), stepping down")
                 await self._become_follower()
     
     async def request_vote(self, candidate_id: str, term: int) -> bool:
@@ -486,7 +486,7 @@ class ClusterRaft:
             self.voted_for = candidate_id
             self.last_heartbeat = time.time()
             self._persist_state()  # Persist vote before confirming
-            print(f"🗳️  Voted for {candidate_id} in term {term}")
+            print(f"Voted for {candidate_id} in term {term}")
             return True
         
         return False
@@ -520,10 +520,10 @@ class ClusterRaft:
 # Example usage
 async def main():
     async def became_leader():
-        print("🎉 I am now the leader!")
+        print("I am now the leader!")
     
     async def lost_leadership():
-        print("😔 I am no longer the leader")
+        print("I am no longer the leader")
     
     raft = ClusterRaft(
         node_id="node001",

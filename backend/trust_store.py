@@ -37,19 +37,19 @@ class TrustStore:
             try:
                 with open(self.trust_store_path, 'r') as f:
                     self.trusted_peers = json.load(f)
-                print(f"🔐 Loaded {len(self.trusted_peers)} trusted peer(s)")
+                print(f"Loaded {len(self.trusted_peers)} trusted peer(s)")
                 
                 # Print trusted peers
                 for node_id, info in self.trusted_peers.items():
-                    print(f"   • {info['node_name']} ({node_id[:8]}...)")
+                    print(f"• {info['node_name']} ({node_id[:8]}...)")
                     
             except Exception as e:
-                print(f"⚠️  Failed to load trust store: {e}")
-                print(f"   Starting with empty trust store")
+                print(f"Failed to load trust store: {e}")
+                print(f"Starting with empty trust store")
                 self.trusted_peers = {}
         else:
-            print(f"🔐 No trust store found at {self.trust_store_path}")
-            print(f"   Starting with empty trust store (will trust on first use)")
+            print(f"No trust store found at {self.trust_store_path}")
+            print(f"Starting with empty trust store (will trust on first use)")
     
     def _save_trust_store(self):
         """Save trusted peers to disk"""
@@ -66,7 +66,7 @@ class TrustStore:
             temp_path.replace(self.trust_store_path)
             
         except Exception as e:
-            print(f"❌ Failed to save trust store: {e}")
+            print(f"Failed to save trust store: {e}")
     
     def is_trusted(self, node_id: str) -> bool:
         """Check if a node ID is in the trust store"""
@@ -93,13 +93,13 @@ class TrustStore:
         # First time seeing this node (or forced update)
         if node_id in self.trusted_peers and force:
             old_key = self.trusted_peers[node_id]['public_key']
-            print(f"⚠️  REPLACING trust for {node_name} ({node_id[:8]}...)")
-            print(f"   Old key: {old_key[:32]}...")
-            print(f"   New key: {public_key_b64[:32]}...")
+            print(f"REPLACING trust for {node_name} ({node_id[:8]}...)")
+            print(f"Old key: {old_key[:32]}...")
+            print(f"New key: {public_key_b64[:32]}...")
         else:
-            print(f"🤝 Trusting new peer: {node_name} ({node_id[:8]}...)")
-            print(f"   Public key: {public_key_b64[:32]}...")
-            print(f"   ⚠️  Using TOFU: Trusting on first contact")
+            print(f"Trusting new peer: {node_name} ({node_id[:8]}...)")
+            print(f"Public key: {public_key_b64[:32]}...")
+            print(f"Using TOFU: Trusting on first contact")
         
         self.trusted_peers[node_id] = {
             'public_key': public_key_b64,
@@ -126,10 +126,10 @@ class TrustStore:
             node_name = self.trusted_peers[node_id]['node_name']
             del self.trusted_peers[node_id]
             self._save_trust_store()
-            print(f"🚫 Removed trust for {node_name} ({node_id[:8]}...)")
-            print(f"   Future messages from this node will be rejected")
+            print(f"Removed trust for {node_name} ({node_id[:8]}...)")
+            print(f"Future messages from this node will be rejected")
         else:
-            print(f"⚠️  Node {node_id[:8]}... not in trust store")
+            print(f"Node {node_id[:8]}... not in trust store")
     
     def get_public_key(self, node_id: str) -> str:
         """
@@ -173,7 +173,7 @@ class TrustStore:
         valid, message = NodeIdentity.verify_signed_json(signed_data)
         
         if not valid:
-            print(f"❌ Signature verification failed: Invalid signature")
+            print(f"Signature verification failed: Invalid signature")
             return False, None, None
         
         # Extract identity
@@ -184,9 +184,9 @@ class TrustStore:
         # Step 2: Check trust status
         if not self.is_trusted(node_id):
             # TOFU: Trust on first use
-            print(f"⚠️  First time seeing node {node_name} ({node_id[:8]}...)")
-            print(f"   Public key: {public_key_b64[:32]}...")
-            print(f"   Trusting based on TOFU policy")
+            print(f"First time seeing node {node_name} ({node_id[:8]}...)")
+            print(f"Public key: {public_key_b64[:32]}...")
+            print(f"Trusting based on TOFU policy")
             
             self.trust_peer(node_id, public_key_b64, node_name)
             return True, message, node_id
@@ -196,17 +196,17 @@ class TrustStore:
         
         if stored_key != public_key_b64:
             # PUBLIC KEY MISMATCH - This is serious!
-            print(f"🚨 PUBLIC KEY MISMATCH for {node_name} ({node_id[:8]}...)!")
-            print(f"   Stored key:   {stored_key[:32]}...")
-            print(f"   Received key: {public_key_b64[:32]}...")
-            print(f"   ")
-            print(f"   This could be:")
-            print(f"   1. Legitimate key rotation (use --force-trust if intentional)")
-            print(f"   2. Man-in-the-middle attack")
-            print(f"   3. Node reinstalled without backing up keys")
-            print(f"   4. Someone trying to impersonate this node")
-            print(f"   ")
-            print(f"   REJECTING message for security")
+            print(f"PUBLIC KEY MISMATCH for {node_name} ({node_id[:8]}...)!")
+            print(f"Stored key:   {stored_key[:32]}...")
+            print(f"Received key: {public_key_b64[:32]}...")
+            print(f"")
+            print(f"This could be:")
+            print(f"1. Legitimate key rotation (use --force-trust if intentional)")
+            print(f"2. Man-in-the-middle attack")
+            print(f"3. Node reinstalled without backing up keys")
+            print(f"4. Someone trying to impersonate this node")
+            print(f"")
+            print(f"REJECTING message for security")
             return False, None, None
         
         # All checks passed!
@@ -272,11 +272,11 @@ if __name__ == "__main__":
         else:
             print(f"\nTrusted peers ({len(peers)}):\n")
             for peer in peers:
-                print(f"  {peer['node_name']}")
-                print(f"    Node ID:    {peer['node_id']}")
-                print(f"    Public key: {peer['public_key'][:32]}...")
-                print(f"    First seen: {peer['first_seen']}")
-                print(f"    Last seen:  {peer['last_seen']}")
+                print(f"{peer['node_name']}")
+                print(f"Node ID:    {peer['node_id']}")
+                print(f"Public key: {peer['public_key'][:32]}...")
+                print(f"First seen: {peer['first_seen']}")
+                print(f"Last seen:  {peer['last_seen']}")
                 print()
     
     elif args.command == 'trust':

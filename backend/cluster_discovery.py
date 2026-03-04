@@ -198,7 +198,7 @@ class ClusterDiscovery:
             
             # Check if new or updated
             if discovered_node_id not in self.discovered_nodes:
-                print(f"✨ Discovered node: {node_info['node_name']} at {ip_address}:{info.port}")
+                print(f"Discovered node: {node_info['node_name']} at {ip_address}:{info.port}")
                 self.discovered_nodes[discovered_node_id] = node_info
                 
                 # Callback

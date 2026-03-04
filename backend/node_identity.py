@@ -56,12 +56,12 @@ class NodeIdentity:
                 with open(public_key_path, 'rb') as f:
                     self.public_key = serialization.load_pem_public_key(f.read())
                 
-                print(f"🔑 Loaded existing keys for {self.node_name}")
-                print(f"   Key location: {self.keys_path}")
+                print(f"Loaded existing keys for {self.node_name}")
+                print(f"Key location: {self.keys_path}")
                 
             except Exception as e:
-                print(f"❌ Failed to load keys: {e}")
-                print(f"   Generating new keys...")
+                print(f"Failed to load keys: {e}")
+                print(f"Generating new keys...")
                 self._generate_new_keys(private_key_path, public_key_path)
         else:
             # Generate new keys
@@ -95,10 +95,10 @@ class NodeIdentity:
         private_key_path.chmod(0o600)  # Owner read/write only
         public_key_path.chmod(0o644)   # Owner read/write, others read
         
-        print(f"🔑 Generated new keys for {self.node_name}")
-        print(f"   Private key: {private_key_path} (600)")
-        print(f"   Public key:  {public_key_path} (644)")
-        print(f"   ⚠️  BACKUP THESE KEYS! Loss means loss of identity.")
+        print(f"Generated new keys for {self.node_name}")
+        print(f"Private key: {private_key_path} (600)")
+        print(f"Public key:  {public_key_path} (644)")
+        print(f"BACKUP THESE KEYS! Loss means loss of identity.")
     
     def get_public_key_bytes(self) -> bytes:
         """Get public key as raw bytes (32 bytes for Ed25519)"""
@@ -208,7 +208,7 @@ class NodeIdentity:
             actual_node_id = hashlib.sha256(public_key_bytes).hexdigest()[:16]
             
             if actual_node_id != claimed_node_id:
-                print(f"❌ Node ID mismatch: claimed={claimed_node_id}, actual={actual_node_id}")
+                print(f"Node ID mismatch: claimed={claimed_node_id}, actual={actual_node_id}")
                 return False, None
             
             # Recreate message bytes (canonical JSON)
@@ -219,14 +219,14 @@ class NodeIdentity:
             if NodeIdentity.verify_signature(public_key_b64, message_bytes, signature):
                 return True, message
             else:
-                print(f"❌ Signature verification failed")
+                print(f"Signature verification failed")
                 return False, None
         
         except KeyError as e:
-            print(f"❌ Missing required field in signed message: {e}")
+            print(f"Missing required field in signed message: {e}")
             return False, None
         except Exception as e:
-            print(f"❌ Signature verification error: {e}")
+            print(f"Signature verification error: {e}")
             return False, None
 
 
@@ -255,12 +255,12 @@ if __name__ == "__main__":
         
         signed = identity.sign_json(message)
         print(f"\nSigned envelope:")
-        print(f"  Node ID: {signed['node_id']}")
-        print(f"  Signature: {signed['signature'][:32]}...")
+        print(f"Node ID: {signed['node_id']}")
+        print(f"Signature: {signed['signature'][:32]}...")
         
         # Verify
         valid, decoded = NodeIdentity.verify_signed_json(signed)
-        print(f"\nVerification result: {'✅ VALID' if valid else '❌ INVALID'}")
+        print(f"\nVerification result: {'VALID' if valid else 'INVALID'}")
         print(f"Decoded message: {decoded}")
         
         # Try to tamper
@@ -269,4 +269,4 @@ if __name__ == "__main__":
         tampered['message']['timestamp'] = 999999  # Change message
         
         valid, decoded = NodeIdentity.verify_signed_json(tampered)
-        print(f"Tampered verification: {'✅ VALID' if valid else '❌ INVALID (as expected)'}")
+        print(f"Tampered verification: {'VALID' if valid else 'INVALID (as expected)'}")
