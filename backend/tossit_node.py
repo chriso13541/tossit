@@ -86,7 +86,7 @@ async def db_flush_with_retry(db, max_retries=5, base_delay=0.05):
             raise
 
 from models import (
-    Base, Node, File as FileModel, Chunk, Replica, Job, AuditLog,
+    Base, Node, File as FileModel, FileChunk, ChunkLocation, Job, AuditLog,
     NodeStatus, JobStatus, JobType
 )
 
@@ -114,13 +114,23 @@ def get_disk_usage(path: Path) -> tuple[float, float, float]:
 
 def get_storage_usage(storage_path: Path) -> float:
     """
-    Calculate actual storage used by TossIt files only
+    Calculate actual storage used by TossIt chunk data.
+    Scans both content-addressed chunks/ dir and legacy file_*.dat files.
     Returns: used_gb
     """
     total_bytes = 0
     
-    # Calculate size of all files in storage directory
     if storage_path.exists():
+        # Content-addressed chunks (new layout)
+        chunks_dir = storage_path / "chunks"
+        if chunks_dir.exists():
+            for chunk_file in chunks_dir.glob("*.dat"):
+                try:
+                    total_bytes += chunk_file.stat().st_size
+                except Exception:
+                    pass
+        
+        # Legacy file_*.dat (old layout, for migration)
         for file_path in storage_path.glob("file_*.dat"):
             try:
                 total_bytes += file_path.stat().st_size
@@ -349,6 +359,14 @@ class TossItNode:
         os.environ['TMPDIR'] = str(upload_temp_dir)
         tempfile.tempdir = str(upload_temp_dir)
         print(f"✓ Upload temp: {upload_temp_dir} (bypasses tmpfs)")
+        
+        # Content-addressed storage directories
+        self.chunks_dir = self.config.storage_path / "chunks"
+        self.chunks_dir.mkdir(exist_ok=True, parents=True)
+        self.staging_dir = self.config.storage_path / "staging"
+        self.staging_dir.mkdir(exist_ok=True, parents=True)
+        print(f"✓ Content-addressed storage: {self.chunks_dir}")
+        print(f"✓ Upload staging: {self.staging_dir}")
 
         # SECURITY: Initialize cryptographic identity
         keys_path = Path.home() / ".tossit" / "keys" / config.node_name
@@ -622,8 +640,22 @@ class TossItNode:
             print("📡 Stopped registry heartbeat")
     
     def _cleanup_temp_files(self):
-        """Remove leftover temp files from interrupted uploads"""
+        """Remove leftover staging directories and temp files from interrupted uploads"""
         import glob
+        import shutil as _shutil
+        
+        # Clean content-addressed staging dirs
+        if self.staging_dir.exists():
+            staging_dirs = list(self.staging_dir.iterdir())
+            if staging_dirs:
+                for d in staging_dirs:
+                    try:
+                        _shutil.rmtree(d)
+                    except Exception:
+                        pass
+                print(f"🧹 Cleaned up {len(staging_dirs)} staging directories")
+        
+        # Clean legacy temp files
         pattern = str(self.config.storage_path / "tmp_*_chunk_*.dat")
         temp_files = glob.glob(pattern)
         if temp_files:
@@ -632,7 +664,7 @@ class TossItNode:
                     Path(f).unlink()
                 except Exception:
                     pass
-            print(f"🧹 Cleaned up {len(temp_files)} temp files from interrupted uploads")
+            print(f"🧹 Cleaned up {len(temp_files)} legacy temp files")
     
     def _ensure_node_record(self):
         """Ensure this node exists in the database"""
@@ -691,26 +723,25 @@ class TossItNode:
         chunk_paths: list
     ):
         """
-        Write a chunk to disk during streaming upload (NO DATABASE WRITES).
+        Write a chunk to staging during streaming upload (NO DATABASE WRITES).
         
-        All DB writes are deferred to the end of the upload to minimize
-        the SQLite write lock window from minutes → milliseconds.
-        
-        Chunk metadata is tracked in-memory for batch DB insert later.
+        Content-addressed: the chunk's SHA-256 hash IS its filename.
+        Written to staging/{upload_id}/{hash}.dat, then moved to chunks/
+        on commit. If chunks/{hash}.dat already exists, that's deduplication.
         
         Args:
-            temp_id: Temporary upload ID (string) for filenames before DB commit
+            temp_id: Upload session ID — becomes staging subdirectory name
         """
         chunk_data = bytes(chunk_buffer)
         chunk_size = len(chunk_data)
         
-        # Calculate chunk checksum
-        chunk_hash = hashlib.sha256()
-        chunk_hash.update(chunk_data)
-        chunk_checksum = chunk_hash.hexdigest()
+        # Content hash = chunk identity
+        chunk_checksum = hashlib.sha256(chunk_data).hexdigest()
         
-        # Write to disk using temp name (non-blocking)
-        chunk_path = self.config.storage_path / f"tmp_{temp_id}_chunk_{chunk_index}.dat"
+        # Write to staging dir (non-blocking)
+        stage_dir = self.staging_dir / temp_id
+        stage_dir.mkdir(exist_ok=True, parents=True)
+        chunk_path = stage_dir / f"{chunk_checksum}.dat"
         
         def write_chunk():
             with open(chunk_path, 'wb') as f:
@@ -718,13 +749,11 @@ class TossItNode:
         
         await asyncio.to_thread(write_chunk)
         
-        # Verify chunk (read back and check checksum)
+        # Verify chunk (read back and check hash)
         def verify_chunk():
             with open(chunk_path, 'rb') as f:
                 written_data = f.read()
-            verify_hash = hashlib.sha256()
-            verify_hash.update(written_data)
-            return verify_hash.hexdigest()
+            return hashlib.sha256(written_data).hexdigest()
         
         written_checksum = await asyncio.to_thread(verify_chunk)
         if written_checksum != chunk_checksum:
@@ -734,11 +763,11 @@ class TossItNode:
         chunk_meta_list.append({
             'chunk_index': chunk_index,
             'size_bytes': chunk_size,
-            'checksum_sha256': chunk_checksum,
+            'chunk_hash': chunk_checksum,
         })
         chunk_paths.append(chunk_path)
         
-        print(f"   ✓ Chunk {chunk_index}: {chunk_size:,} bytes (verified)")
+        print(f"   ✓ Chunk {chunk_index}: {chunk_size:,} bytes → {chunk_checksum[:12]}...")
         
         # Yield to event loop
         await asyncio.sleep(0)
@@ -857,12 +886,12 @@ class TossItNode:
                 }
                 
                 # Convert ORM chunk records to plain dicts (session-independent)
-                fresh_chunks = db.query(Chunk).filter(
-                    Chunk.file_id == file_id
-                ).order_by(Chunk.chunk_index).all()
+                fresh_chunks = db.query(FileChunk).filter(
+                    FileChunk.file_id == file_id
+                ).order_by(FileChunk.chunk_index).all()
                 
                 chunk_records = [
-                    {'chunk_index': c.chunk_index, 'checksum_sha256': c.checksum_sha256}
+                    {'chunk_index': c.chunk_index, 'chunk_hash': c.chunk_hash}
                     for c in fresh_chunks
                 ]
             finally:
@@ -965,17 +994,17 @@ class TossItNode:
         """
         Read a chunk from disk and send it with ACK verification.
         
-        Reads from disk to avoid holding entire file in memory.
+        Reads from content-addressed chunks/ directory by hash.
         Uses persistent aiohttp session for connection reuse.
         
         Args:
-            chunk: Plain dict with 'chunk_index' and 'checksum_sha256' keys
+            chunk: Plain dict with 'chunk_index' and 'chunk_hash' keys
         
         Returns:
             True if chunk was ACKed, False otherwise
         """
         idx = chunk['chunk_index']
-        checksum = chunk['checksum_sha256']
+        checksum = chunk['chunk_hash']
         
         try:
             import base64
@@ -984,10 +1013,10 @@ class TossItNode:
             # Without this, multiple files finishing at once flood the peer with 24+
             # concurrent 64MB transfers, causing I/O saturation and health check timeouts.
             async with self._replication_semaphore:
-                # Read chunk data from disk (non-blocking)
-                chunk_path = self.config.storage_path / f"file_{file_id}_chunk_{idx}.dat"
+                # Read chunk data from content-addressed store
+                chunk_path = self.chunks_dir / f"{checksum}.dat"
                 if not chunk_path.exists():
-                    print(f"  ✗ Chunk {idx} file not found: {chunk_path}")
+                    print(f"  ✗ Chunk {idx} not found: {checksum[:12]}...")
                     return False
                 
                 chunk_data = await asyncio.to_thread(chunk_path.read_bytes)
@@ -1261,31 +1290,25 @@ class TossItNode:
         # ========================================
         # STEP 2: Scan local disk for orphaned chunks
         # ========================================
-        import re
-        orphaned_files = {}  # file_id -> list of (chunk_index, size_bytes)
+        orphaned_hashes = []
         
-        for dat_file in self.config.storage_path.glob("file_*_chunk_*.dat"):
-            match = re.match(r'file_(\d+)_chunk_(\d+)\.dat', dat_file.name)
-            if match:
-                fid = int(match.group(1))
-                cidx = int(match.group(2))
-                
-                db = self.SessionLocal()
-                try:
-                    exists = db.query(Chunk).filter(
-                        Chunk.file_id == fid,
-                        Chunk.chunk_index == cidx
-                    ).first()
-                    if not exists:
-                        if fid not in orphaned_files:
-                            orphaned_files[fid] = []
-                        orphaned_files[fid].append((cidx, dat_file.stat().st_size))
-                finally:
-                    db.close()
+        if self.chunks_dir.exists():
+            db = self.SessionLocal()
+            try:
+                for dat_file in self.chunks_dir.glob("*.dat"):
+                    chunk_hash = dat_file.stem
+                    if len(chunk_hash) == 64:
+                        # Check if any file references this chunk
+                        refs = db.query(FileChunk).filter(
+                            FileChunk.chunk_hash == chunk_hash
+                        ).count()
+                        if refs == 0:
+                            orphaned_hashes.append(chunk_hash)
+            finally:
+                db.close()
         
-        if orphaned_files:
-            total_orphans = sum(len(v) for v in orphaned_files.values())
-            print(f"🔍 Step 2: Found {total_orphans} orphaned chunks across {len(orphaned_files)} files on local disk")
+        if orphaned_hashes:
+            print(f"🔍 Step 2: Found {len(orphaned_hashes)} orphaned chunks on local disk (unreferenced by any file)")
         else:
             print(f"✓  Step 2: No orphaned chunks on local disk")
         
@@ -1380,9 +1403,30 @@ class TossItNode:
                                 )
                                 db2.add(new_file)
                             
+                            await db_flush_with_retry(db2)
+                            
+                            # Import FileChunk mappings from peer's inventory.
+                            # Without these, the file exists in metadata but has no
+                            # chunk references — it can't be downloaded or replicated.
+                            for chunk_info in file_info.get("chunks_on_disk", []):
+                                existing_fc = db2.query(FileChunk).filter(
+                                    FileChunk.file_id == file_id,
+                                    FileChunk.chunk_index == chunk_info["chunk_index"]
+                                ).first()
+                                
+                                if not existing_fc:
+                                    fc = FileChunk(
+                                        file_id=file_id,
+                                        chunk_index=chunk_info["chunk_index"],
+                                        chunk_hash=chunk_info["chunk_hash"],
+                                        size_bytes=chunk_info["size_bytes"],
+                                    )
+                                    db2.add(fc)
+                            
                             await db_commit_with_retry(db2)
                             files_imported += 1
-                            print(f"   📥 Imported: {file_info['filename']} (ID: {file_id}) from {peer_name}")
+                            chunk_count = len(file_info.get("chunks_on_disk", []))
+                            print(f"   📥 Imported: {file_info['filename']} (ID: {file_id}, {chunk_count} chunks) from {peer_name}")
                         except Exception as e:
                             db2.rollback()
                             print(f"   ⚠️  Failed to import file {file_id}: {e}")
@@ -1410,9 +1454,15 @@ class TossItNode:
                 ).all()
                 
                 for f in unreplicated:
-                    # Check if we have the chunks locally
-                    local_chunks = db.query(Chunk).filter(Chunk.file_id == f.id).count()
-                    has_local = local_chunks == f.total_chunks
+                    # Check if we have the chunks PHYSICALLY on disk (not just in DB).
+                    # After reconciliation, we may have imported FileChunk mappings from
+                    # a peer but don't have the actual chunk data locally.
+                    file_chunks = db.query(FileChunk).filter(FileChunk.file_id == f.id).all()
+                    local_on_disk = sum(
+                        1 for fc in file_chunks
+                        if (self.chunks_dir / f"{fc.chunk_hash}.dat").exists()
+                    )
+                    has_local = local_on_disk == f.total_chunks
                     
                     if has_local:
                         # We have the file — replicate to peers
@@ -1455,17 +1505,16 @@ class TossItNode:
         db = self.SessionLocal()
         try:
             # Find files that need more replicas
-            # (Files where replica count < desired replication factor)
             files_needing_replication = db.execute(
                 text("""
                     SELECT 
                         f.id,
                         f.filename,
-                        COUNT(DISTINCT r.node_id) as current_replicas,
+                        COUNT(DISTINCT cl.node_id) as current_replicas,
                         f.total_chunks
                     FROM files f
-                    JOIN chunks c ON c.file_id = f.id
-                    LEFT JOIN replicas r ON r.chunk_id = c.id
+                    JOIN file_chunks fc ON fc.file_id = f.id
+                    LEFT JOIN chunk_locations cl ON cl.chunk_hash = fc.chunk_hash
                     WHERE f.is_complete = 1
                     GROUP BY f.id, f.filename, f.total_chunks
                 """)
@@ -1506,10 +1555,10 @@ class TossItNode:
             for file_id, filename, current_replicas, total_chunks in files_to_replicate:
                 print(f"📦 Replicating: {filename} (currently {current_replicas} replicas, want {target_replication})")
                 
-                # Get chunk records
-                chunks = db.query(Chunk).filter(
-                    Chunk.file_id == file_id
-                ).order_by(Chunk.chunk_index).all()
+                # Get chunk records (content-addressed)
+                chunks = db.query(FileChunk).filter(
+                    FileChunk.file_id == file_id
+                ).order_by(FileChunk.chunk_index).all()
                 
                 if not chunks:
                     print(f"   ⚠️  No chunks found for file {file_id}")
@@ -1996,14 +2045,12 @@ class TossItNode:
                 file_checksum = file_hash.hexdigest()
                 
                 # ========================================
-                # PHASE 2: Batch DB write (serialized, fast)
+                # PHASE 2: Atomic DB commit (File + FileChunks + ChunkLocations)
                 # ========================================
                 async with self._db_write_semaphore:
                     db = self.SessionLocal()
                     try:
                         if is_delegated:
-                            # Delegated upload: use the pre-assigned file_id from the leader.
-                            # Create a new record with explicit ID (same pattern as replication).
                             file_record = FileModel(
                                 id=delegated_file_id,
                                 filename=file.filename,
@@ -2016,7 +2063,6 @@ class TossItNode:
                                 is_replicated=False
                             )
                         else:
-                            # Normal upload: auto-increment ID
                             file_record = FileModel(
                                 filename=file.filename,
                                 total_size_bytes=file_size,
@@ -2028,29 +2074,32 @@ class TossItNode:
                                 is_replicated=False
                             )
                         db.add(file_record)
-                        await db_flush_with_retry(db)  # Get file_record.id
+                        await db_flush_with_retry(db)
                         
                         file_id = file_record.id
                         
                         for meta in chunk_meta_list:
-                            chunk_record = Chunk(
+                            # FileChunk: ordered mapping from file → content-addressed chunk
+                            file_chunk = FileChunk(
                                 file_id=file_id,
                                 chunk_index=meta['chunk_index'],
+                                chunk_hash=meta['chunk_hash'],
                                 size_bytes=meta['size_bytes'],
-                                checksum_sha256=meta['checksum_sha256'],
-                                primary_node_id=None
                             )
-                            db.add(chunk_record)
-                            await db_flush_with_retry(db)
+                            db.add(file_chunk)
                             
-                            replica = Replica(
-                                chunk_id=chunk_record.id,
-                                node_id=1,
-                                is_primary=True,
-                                local_path=str(self.config.storage_path / f"file_{file_id}_chunk_{meta['chunk_index']}.dat"),
-                                verification_status="verified"
-                            )
-                            db.add(replica)
+                            # ChunkLocation: this node has this chunk
+                            # Only add if not already tracked (dedup)
+                            existing_loc = db.query(ChunkLocation).filter(
+                                ChunkLocation.chunk_hash == meta['chunk_hash'],
+                                ChunkLocation.node_id == 1
+                            ).first()
+                            if not existing_loc:
+                                location = ChunkLocation(
+                                    chunk_hash=meta['chunk_hash'],
+                                    node_id=1,
+                                )
+                                db.add(location)
                         
                         await db_commit_with_retry(db)
                     except Exception:
@@ -2060,12 +2109,22 @@ class TossItNode:
                         db.close()
                 
                 # ========================================
-                # PHASE 3: Rename temp → permanent
+                # PHASE 3: Move staging → chunks/ (content-addressed)
                 # ========================================
-                for i, temp_path in enumerate(chunk_paths_temp):
-                    final_path = self.config.storage_path / f"file_{file_id}_chunk_{i}.dat"
-                    if temp_path != final_path:
-                        await asyncio.to_thread(temp_path.rename, final_path)
+                for meta in chunk_meta_list:
+                    staged_path = self.staging_dir / temp_id / f"{meta['chunk_hash']}.dat"
+                    final_path = self.chunks_dir / f"{meta['chunk_hash']}.dat"
+                    if final_path.exists():
+                        # Dedup: chunk already exists from another upload
+                        staged_path.unlink(missing_ok=True)
+                    elif staged_path.exists():
+                        await asyncio.to_thread(staged_path.rename, final_path)
+                
+                # Clean up staging directory
+                stage_dir = self.staging_dir / temp_id
+                if stage_dir.exists():
+                    import shutil as _shutil
+                    _shutil.rmtree(stage_dir, ignore_errors=True)
                 
                 await self._commit_reservation(file_size_gb)
                 
@@ -2075,14 +2134,11 @@ class TossItNode:
                 
                 # Update load balancer counter
                 if is_delegated:
-                    # Delegated upload finished — tell the leader to decrement our counter
                     asyncio.create_task(self._notify_leader_upload_complete())
                 else:
-                    # Local upload on leader — decrement self counter
                     await self._decrement_assignment("self")
                 
-                # Replicate to peers if available (even if leadership changed during upload,
-                # this file exists only on this node and needs redundancy)
+                # Replicate to peers if available
                 if len(self.peer_nodes) > 0:
                     asyncio.create_task(self._replicate_file_chunks(file_id))
                 
@@ -2099,10 +2155,11 @@ class TossItNode:
             
             except HTTPException:
                 await self._release_reservation(file_size_gb)
-                for p in chunk_paths_temp:
-                    if p.exists():
-                        p.unlink()
-                # Decrement load balancer counter on failure too
+                # Clean staging dir on failure
+                stage_dir = self.staging_dir / temp_id
+                if stage_dir.exists():
+                    import shutil as _shutil
+                    _shutil.rmtree(stage_dir, ignore_errors=True)
                 if is_delegated:
                     asyncio.create_task(self._notify_leader_upload_complete())
                 else:
@@ -2111,13 +2168,10 @@ class TossItNode:
             except Exception as e:
                 print(f"❌ Upload failed (streaming): {e}")
                 await self._release_reservation(file_size_gb)
-                for p in chunk_paths_temp:
-                    try:
-                        if p.exists():
-                            p.unlink()
-                    except Exception:
-                        pass
-                # Decrement load balancer counter on failure too
+                stage_dir = self.staging_dir / temp_id
+                if stage_dir.exists():
+                    import shutil as _shutil
+                    _shutil.rmtree(stage_dir, ignore_errors=True)
                 if is_delegated:
                     asyncio.create_task(self._notify_leader_upload_complete())
                 else:
@@ -2233,69 +2287,65 @@ class TossItNode:
                 # Process and store each chunk
                 chunk_records = []
                 for chunk_index in range(total_chunks):
-                    # Calculate chunk boundaries
                     start_byte = chunk_index * CHUNK_SIZE
                     end_byte = min(start_byte + CHUNK_SIZE, file_size)
                     chunk_data = content[start_byte:end_byte]
                     chunk_size = len(chunk_data)
                     
-                    # Calculate chunk checksum
-                    chunk_hash = hashlib.sha256()
-                    chunk_hash.update(chunk_data)
-                    chunk_checksum = chunk_hash.hexdigest()
+                    # Content hash = chunk identity
+                    chunk_checksum = hashlib.sha256(chunk_data).hexdigest()
                     
-                    # Create chunk record (NOT committed yet)
-                    chunk_record = Chunk(
+                    # Create FileChunk mapping
+                    file_chunk = FileChunk(
                         file_id=file_record.id,
                         chunk_index=chunk_index,
+                        chunk_hash=chunk_checksum,
                         size_bytes=chunk_size,
-                        checksum_sha256=chunk_checksum,
-                        primary_node_id=None
                     )
-                    db.add(chunk_record)
-                    await db_flush_with_retry(db)  # Get ID without committing
+                    db.add(file_chunk)
                     
-                    # CRITICAL: Write to disk BEFORE committing to database
-                    # Use asyncio.to_thread to prevent blocking
-                    chunk_path = self.config.storage_path / f"file_{file_record.id}_chunk_{chunk_index}.dat"
+                    # Write to content-addressed store
+                    chunk_path = self.chunks_dir / f"{chunk_checksum}.dat"
                     try:
-                        def write_chunk():
-                            with open(chunk_path, 'wb') as f:
-                                f.write(chunk_data)
+                        if not chunk_path.exists():
+                            def write_chunk():
+                                with open(chunk_path, 'wb') as f:
+                                    f.write(chunk_data)
+                            
+                            await asyncio.to_thread(write_chunk)
+                            chunk_paths.append(chunk_path)
+                            
+                            def verify_chunk():
+                                with open(chunk_path, 'rb') as f:
+                                    written_data = f.read()
+                                return hashlib.sha256(written_data).hexdigest()
+                            
+                            written_checksum = await asyncio.to_thread(verify_chunk)
+                            if written_checksum != chunk_checksum:
+                                raise Exception(f"Chunk {chunk_index} verification failed: checksum mismatch after write")
+                        else:
+                            # Dedup: chunk already on disk
+                            chunk_paths.append(chunk_path)
                         
-                        await asyncio.to_thread(write_chunk)
-                        chunk_paths.append(chunk_path)  # Track for cleanup
-                        
-                        # VERIFY: Read back and verify checksum
-                        def verify_chunk():
-                            with open(chunk_path, 'rb') as f:
-                                written_data = f.read()
-                            verify_hash = hashlib.sha256()
-                            verify_hash.update(written_data)
-                            return verify_hash.hexdigest()
-                        
-                        written_checksum = await asyncio.to_thread(verify_chunk)
-                        if written_checksum != chunk_checksum:
-                            raise Exception(f"Chunk {chunk_index} verification failed: checksum mismatch after write")
-                        
-                        # Yield to event loop every chunk (allows heartbeats to be processed)
                         await asyncio.sleep(0)
                     except IOError as disk_error:
                         raise Exception(f"Disk write failed for chunk {chunk_index}: {disk_error}")
                     
-                    # Create replica record (NOT committed yet)
-                    replica = Replica(
-                        chunk_id=chunk_record.id,
-                        node_id=1,  # Self node ID
-                        is_primary=True,
-                        local_path=str(chunk_path),
-                        verification_status="verified"
-                    )
-                    db.add(replica)
+                    # Track chunk location on this node
+                    existing_loc = db.query(ChunkLocation).filter(
+                        ChunkLocation.chunk_hash == chunk_checksum,
+                        ChunkLocation.node_id == 1
+                    ).first()
+                    if not existing_loc:
+                        location = ChunkLocation(
+                            chunk_hash=chunk_checksum,
+                            node_id=1,
+                        )
+                        db.add(location)
                     
-                    chunk_records.append(chunk_record)
+                    chunk_records.append(file_chunk)
                     
-                    print(f"   ✓ Chunk {chunk_index + 1}/{total_chunks}: {chunk_size:,} bytes (checksum: {chunk_checksum[:16]}...)")
+                    print(f"   ✓ Chunk {chunk_index + 1}/{total_chunks}: {chunk_size:,} bytes → {chunk_checksum[:12]}...")
                 
                 # ALL chunks written successfully to disk!
                 # Now mark file as complete
@@ -2330,7 +2380,7 @@ class TossItNode:
                         {
                             "chunk_index": c.chunk_index,
                             "size_bytes": c.size_bytes,
-                            "checksum": c.checksum_sha256
+                            "checksum": c.chunk_hash
                         }
                         for c in chunk_records
                     ]
@@ -2352,13 +2402,20 @@ class TossItNode:
                 await self._release_reservation(file_size_gb)
                 print(f"   Space reservation released: {file_size_gb:.2f}GB refunded")
                 
-                # CLEANUP: Delete ALL physical chunk files that were written
-                # This ensures no orphaned files on disk
+                # CLEANUP: Delete physical chunk files that were written
+                # Only delete if no other file references this chunk (dedup safety)
                 for chunk_path in chunk_paths:
                     try:
                         if chunk_path.exists():
-                            chunk_path.unlink()
-                            print(f"   Cleaned up: {chunk_path.name}")
+                            chunk_hash = chunk_path.stem
+                            refs = db.query(FileChunk).filter(
+                                FileChunk.chunk_hash == chunk_hash
+                            ).count()
+                            if refs == 0:
+                                chunk_path.unlink()
+                                print(f"   Cleaned up: {chunk_path.name}")
+                            else:
+                                print(f"   Kept (referenced by other file): {chunk_path.name}")
                     except Exception as cleanup_error:
                         print(f"   ⚠️  Cleanup failed for {chunk_path.name}: {cleanup_error}")
                 
@@ -2423,10 +2480,12 @@ class TossItNode:
                 raise HTTPException(400, "Checksum mismatch")
             
             # ========================================
-            # PHASE 2: Write to disk (no DB lock)
+            # PHASE 2: Write to content-addressed store (no DB lock)
             # ========================================
-            chunk_path = self.config.storage_path / f"file_{file_id}_chunk_{chunk_index}.dat"
-            await asyncio.to_thread(chunk_path.write_bytes, chunk_data)
+            chunk_path = self.chunks_dir / f"{chunk_checksum}.dat"
+            if not chunk_path.exists():
+                await asyncio.to_thread(chunk_path.write_bytes, chunk_data)
+            # else: chunk already exists (dedup from another file/upload)
             
             # ========================================
             # PHASE 3: DB write under semaphore (fast)
@@ -2434,14 +2493,10 @@ class TossItNode:
             async with self._db_write_semaphore:
                 db = self.SessionLocal()
                 try:
-                    # ALWAYS ensure file record exists before inserting chunks.
-                    # file_metadata is now sent with every chunk (not just chunk 0),
-                    # but we still guard against edge cases where it's missing.
+                    # Ensure file record exists
                     existing_file = db.query(FileModel).filter(FileModel.id == file_id).first()
                     
                     if existing_file and file_metadata and existing_file.checksum_sha256 == "pending_delegation":
-                        # This is a delegation placeholder created by the leader's assign
-                        # endpoint. Update it with real metadata from the delegated node.
                         existing_file.filename = file_metadata['filename']
                         existing_file.total_size_bytes = file_metadata['total_size_bytes']
                         existing_file.chunk_size_bytes = file_metadata['chunk_size_bytes']
@@ -2465,50 +2520,42 @@ class TossItNode:
                         await db_flush_with_retry(db)
                         print(f"📋 Created file record: {file_metadata['filename']} (ID: {file_id})")
                     elif not existing_file and not file_metadata:
-                        # No file record and no metadata — can't create the parent row.
-                        # Keep the chunk on disk (already written) and tell sender to retry
-                        # with metadata. Don't raise 500 which triggers noisy FK error logs.
                         db.close()
                         print(f"⚠️  Chunk {chunk_index} for file {file_id}: no file record yet, requesting retry with metadata")
                         raise HTTPException(409, f"File record {file_id} not found - retry with file_metadata")
                     
-                    # Create or get chunk record
-                    chunk_record = db.query(Chunk).filter(
-                        Chunk.file_id == file_id,
-                        Chunk.chunk_index == chunk_index
+                    # Create FileChunk mapping (if not already present)
+                    existing_fc = db.query(FileChunk).filter(
+                        FileChunk.file_id == file_id,
+                        FileChunk.chunk_index == chunk_index
                     ).first()
                     
-                    if not chunk_record:
-                        chunk_record = Chunk(
+                    if not existing_fc:
+                        file_chunk = FileChunk(
                             file_id=file_id,
                             chunk_index=chunk_index,
+                            chunk_hash=chunk_checksum,
                             size_bytes=len(chunk_data),
-                            checksum_sha256=chunk_checksum,
-                            primary_node_id=None
                         )
-                        db.add(chunk_record)
-                        await db_flush_with_retry(db)
+                        db.add(file_chunk)
                     
-                    # Create replica record
-                    existing_replica = db.query(Replica).filter(
-                        Replica.chunk_id == chunk_record.id,
-                        Replica.node_id == 1
+                    # Track chunk location on this node (dedup-safe)
+                    existing_loc = db.query(ChunkLocation).filter(
+                        ChunkLocation.chunk_hash == chunk_checksum,
+                        ChunkLocation.node_id == 1
                     ).first()
                     
-                    if not existing_replica:
-                        replica = Replica(
-                            chunk_id=chunk_record.id,
+                    if not existing_loc:
+                        location = ChunkLocation(
+                            chunk_hash=chunk_checksum,
                             node_id=1,
-                            is_primary=False,
-                            local_path=str(chunk_path),
-                            verification_status="verified"
                         )
-                        db.add(replica)
+                        db.add(location)
                     
                     # Check if all chunks received
                     file_record = db.query(FileModel).filter(FileModel.id == file_id).first()
                     if file_record:
-                        chunks_received = db.query(Chunk).filter(Chunk.file_id == file_id).count()
+                        chunks_received = db.query(FileChunk).filter(FileChunk.file_id == file_id).count()
                         if chunks_received == file_record.total_chunks:
                             file_record.is_complete = True
                             file_record.is_replicated = True
@@ -2516,24 +2563,15 @@ class TossItNode:
                     
                     await db_commit_with_retry(db)
                 except HTTPException:
-                    raise  # Re-raise our 409 without cleanup
+                    raise
                 except Exception as e:
                     db.rollback()
-                    # Only clean up disk file for non-FK errors (data corruption, etc).
-                    # FK errors mean the chunk data is fine — just missing parent record.
-                    # Keeping the file on disk avoids re-transferring 64MB on retry.
-                    if "FOREIGN KEY" not in str(e):
-                        try:
-                            if chunk_path.exists():
-                                chunk_path.unlink()
-                        except Exception:
-                            pass
                     print(f"❌ Replication failed: {e}")
                     raise HTTPException(500, f"Replication failed: {str(e)}")
                 finally:
                     db.close()
             
-            print(f"✅ Received replica: file_{file_id}_chunk_{chunk_index} ({len(chunk_data)} bytes)")
+            print(f"✅ Received replica: {chunk_checksum[:12]}... (chunk {chunk_index} of file {file_id}, {len(chunk_data)} bytes)")
             
             return {
                 "status": "ack",
@@ -2549,9 +2587,9 @@ class TossItNode:
             """
             Download a file - streams chunks directly from disk.
             
-            No temp file assembly needed — chunks are read and yielded
-            sequentially. Memory usage: ~64MB (one chunk at a time)
-            regardless of file size. Supports concurrent downloads.
+            Content-addressed: looks up FileChunk mappings to find
+            chunk hashes, then reads from chunks/{hash}.dat in order.
+            Memory usage: ~64MB (one chunk at a time).
             """
             from starlette.responses import StreamingResponse
             
@@ -2570,10 +2608,10 @@ class TossItNode:
                 
                 print(f"📥 Download: {filename} (ID: {file_id}, {total_chunks} chunks)")
                 
-                # Check for complete file (old-style single file uploads)
+                # Check for legacy complete file (old-style single file uploads)
                 complete_file_path = self.config.storage_path / f"file_{file_id}.dat"
                 if complete_file_path.exists():
-                    print(f"   Using complete file: {complete_file_path}")
+                    print(f"   Using legacy complete file: {complete_file_path}")
                     db.close()
                     return FileResponse(
                         path=complete_file_path,
@@ -2581,15 +2619,24 @@ class TossItNode:
                         media_type="application/octet-stream"
                     )
                 
-                # Verify all chunk files exist before starting stream
+                # Look up content-addressed chunk hashes in order
+                file_chunks = db.query(FileChunk).filter(
+                    FileChunk.file_id == file_id
+                ).order_by(FileChunk.chunk_index).all()
+                
                 chunk_paths = []
-                for i in range(total_chunks):
-                    chunk_path = self.config.storage_path / f"file_{file_id}_chunk_{i}.dat"
+                for fc in file_chunks:
+                    chunk_path = self.chunks_dir / f"{fc.chunk_hash}.dat"
                     if not chunk_path.exists():
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"Missing chunk {i} for file {file_id}"
-                        )
+                        # Fallback: check legacy path
+                        legacy_path = self.config.storage_path / f"file_{file_id}_chunk_{fc.chunk_index}.dat"
+                        if legacy_path.exists():
+                            chunk_path = legacy_path
+                        else:
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Missing chunk {fc.chunk_index} ({fc.chunk_hash[:12]}...) for file {file_id}"
+                            )
                     chunk_paths.append(chunk_path)
                 
             finally:
@@ -2614,7 +2661,7 @@ class TossItNode:
         # Delete file endpoint
         @self.app.delete("/api/files/{file_id}")
         async def delete_file(file_id: int):
-            """Delete a file and all its chunks (local + remote replicas)"""
+            """Delete a file. Only removes chunk data if no other file references the chunk."""
             db = self.SessionLocal()
             try:
                 file_record = db.query(FileModel).filter(FileModel.id == file_id).first()
@@ -2623,28 +2670,41 @@ class TossItNode:
                 
                 filename = file_record.filename
                 
-                # Delete complete file if it exists (for old uploads)
+                # Delete legacy complete file if it exists
                 complete_file_path = self.config.storage_path / f"file_{file_id}.dat"
                 if complete_file_path.exists():
                     complete_file_path.unlink()
                 
-                # Delete all chunk files locally
-                chunks = db.query(Chunk).filter(Chunk.file_id == file_id).all()
-                for chunk in chunks:
-                    chunk_path = self.config.storage_path / f"file_{file_id}_chunk_{chunk.chunk_index}.dat"
-                    if chunk_path.exists():
-                        chunk_path.unlink()
+                # Get chunk hashes before deleting the file record
+                file_chunks = db.query(FileChunk).filter(FileChunk.file_id == file_id).all()
+                chunk_hashes = [fc.chunk_hash for fc in file_chunks]
                 
-                # Delete from database (cascades to chunks and replicas)
+                # Delete file record (cascades to file_chunks)
                 db.delete(file_record)
                 await db_commit_with_retry(db)
                 
-                print(f"🗑️  Deleted: {filename} (ID: {file_id}, {len(chunks)} chunks)")
+                # Only delete chunk files that are no longer referenced by ANY file
+                orphaned_count = 0
+                for ch in chunk_hashes:
+                    # Check if any other file still references this chunk
+                    refs = db.query(FileChunk).filter(FileChunk.chunk_hash == ch).count()
+                    if refs == 0:
+                        # No references — safe to delete from disk and location table
+                        chunk_path = self.chunks_dir / f"{ch}.dat"
+                        if chunk_path.exists():
+                            chunk_path.unlink()
+                            orphaned_count += 1
+                        
+                        db.query(ChunkLocation).filter(ChunkLocation.chunk_hash == ch).delete()
+                
+                await db_commit_with_retry(db)
+                
+                print(f"🗑️  Deleted: {filename} (ID: {file_id}, {len(chunk_hashes)} mappings, {orphaned_count} chunks removed from disk)")
                 
                 # Clean up replicas on peer nodes (fire-and-forget)
                 if self.peer_nodes:
                     asyncio.create_task(
-                        self._delete_remote_replicas(file_id, len(chunks))
+                        self._delete_remote_replicas(file_id, len(chunk_hashes), chunk_hashes)
                     )
                 
                 return {"message": "File deleted successfully"}
@@ -2653,36 +2713,44 @@ class TossItNode:
         
         @self.app.post("/api/internal/delete_chunks")
         async def receive_delete_request(request: dict):
-            """Receive chunk deletion request from leader"""
+            """Receive chunk deletion request from leader (content-addressed)"""
             db = self.SessionLocal()
             try:
-                # SECURITY: Verify signature (with backward compatibility)
                 if 'signature' in request and 'public_key' in request:
                     verified, message, sender_node_id = self.trust_store.verify_message(request)
                     if not verified:
                         raise HTTPException(401, "Invalid signature")
                     file_id = message['file_id']
+                    chunk_hashes = message.get('chunk_hashes', [])
                 else:
                     file_id = request.get('file_id')
+                    chunk_hashes = request.get('chunk_hashes', [])
                     if file_id is None:
                         raise HTTPException(400, "Missing file_id")
                 
-                # Delete local chunk files for this file
-                deleted_count = 0
-                chunks = db.query(Chunk).filter(Chunk.file_id == file_id).all()
-                for chunk in chunks:
-                    chunk_path = self.config.storage_path / f"file_{file_id}_chunk_{chunk.chunk_index}.dat"
-                    if chunk_path.exists():
-                        chunk_path.unlink()
-                        deleted_count += 1
-                
-                # Delete DB records (file, chunks, replicas cascade)
+                # Delete file record and mappings
                 file_record = db.query(FileModel).filter(FileModel.id == file_id).first()
                 if file_record:
                     db.delete(file_record)
                     await db_commit_with_retry(db)
                 
-                print(f"🗑️  Deleted remote replicas: file {file_id} ({deleted_count} chunks)")
+                # Delete chunk files only if unreferenced
+                deleted_count = 0
+                for ch in chunk_hashes:
+                    refs = db.query(FileChunk).filter(FileChunk.chunk_hash == ch).count()
+                    if refs == 0:
+                        chunk_path = self.chunks_dir / f"{ch}.dat"
+                        if chunk_path.exists():
+                            chunk_path.unlink()
+                            deleted_count += 1
+                        db.query(ChunkLocation).filter(
+                            ChunkLocation.chunk_hash == ch,
+                            ChunkLocation.node_id == 1
+                        ).delete()
+                
+                await db_commit_with_retry(db)
+                
+                print(f"🗑️  Deleted remote replicas: file {file_id} ({deleted_count} chunks removed)")
                 return {"status": "ok", "deleted_chunks": deleted_count}
             
             except HTTPException:
@@ -2730,12 +2798,9 @@ class TossItNode:
             """
             Lightweight file inventory for leader reconciliation.
             
-            Returns every file this node physically has (complete or not),
-            with chunk-level checksums so the new leader can verify integrity
-            and detect partial uploads.
-            
-            Called by the new leader during _reconcile_on_promotion() to
-            rebuild global metadata from what each node actually stores.
+            Content-addressed: reports chunk hashes physically present on disk,
+            plus file metadata from database. The new leader can rebuild the
+            global file→chunk mapping from this.
             """
             db = self.SessionLocal()
             try:
@@ -2743,19 +2808,22 @@ class TossItNode:
                 inventory = []
                 
                 for f in files:
-                    chunks = db.query(Chunk).filter(
-                        Chunk.file_id == f.id
-                    ).order_by(Chunk.chunk_index).all()
+                    file_chunks = db.query(FileChunk).filter(
+                        FileChunk.file_id == f.id
+                    ).order_by(FileChunk.chunk_index).all()
                     
-                    # Verify chunks actually exist on disk
+                    # Verify chunks actually exist on disk (content-addressed)
                     chunks_on_disk = []
-                    for c in chunks:
-                        chunk_path = self.config.storage_path / f"file_{f.id}_chunk_{c.chunk_index}.dat"
+                    for fc in file_chunks:
+                        chunk_path = self.chunks_dir / f"{fc.chunk_hash}.dat"
+                        if not chunk_path.exists():
+                            # Check legacy path
+                            chunk_path = self.config.storage_path / f"file_{f.id}_chunk_{fc.chunk_index}.dat"
                         if chunk_path.exists():
                             chunks_on_disk.append({
-                                "chunk_index": c.chunk_index,
-                                "size_bytes": c.size_bytes,
-                                "checksum_sha256": c.checksum_sha256,
+                                "chunk_index": fc.chunk_index,
+                                "size_bytes": fc.size_bytes,
+                                "chunk_hash": fc.chunk_hash,
                             })
                     
                     inventory.append({
@@ -2770,31 +2838,29 @@ class TossItNode:
                         "chunks_on_disk": chunks_on_disk,
                     })
                 
-                # Also scan disk for orphaned chunks (on disk but not in DB)
-                import re
-                orphans = []
-                for dat_file in self.config.storage_path.glob("file_*_chunk_*.dat"):
-                    match = re.match(r'file_(\d+)_chunk_(\d+)\.dat', dat_file.name)
-                    if match:
-                        fid = int(match.group(1))
-                        cidx = int(match.group(2))
-                        # Check if this chunk is in the DB
-                        exists = db.query(Chunk).filter(
-                            Chunk.file_id == fid,
-                            Chunk.chunk_index == cidx
-                        ).first()
-                        if not exists:
-                            orphans.append({
-                                "file_id": fid,
-                                "chunk_index": cidx,
-                                "size_bytes": dat_file.stat().st_size,
-                            })
+                # Scan content-addressed store for all chunk hashes on disk
+                # This is the REAL source of truth — physical data present
+                all_chunk_hashes = []
+                if self.chunks_dir.exists():
+                    for dat_file in self.chunks_dir.glob("*.dat"):
+                        chunk_hash = dat_file.stem  # filename without .dat
+                        if len(chunk_hash) == 64:  # valid SHA-256 hex
+                            all_chunk_hashes.append(chunk_hash)
+                
+                # Find chunks on disk not referenced by any file (orphans)
+                referenced_hashes = set()
+                for f_info in inventory:
+                    for c in f_info["chunks_on_disk"]:
+                        referenced_hashes.add(c["chunk_hash"])
+                
+                orphaned_chunks = [h for h in all_chunk_hashes if h not in referenced_hashes]
                 
                 return {
                     "node_id": self.node_id,
                     "node_name": self.config.node_name,
                     "files": inventory,
-                    "orphaned_chunks": orphans,
+                    "all_chunk_hashes": all_chunk_hashes,
+                    "orphaned_chunks": orphaned_chunks,
                 }
             finally:
                 db.close()
@@ -2845,26 +2911,26 @@ class TossItNode:
                 unique_data_bytes = unique_data_result[0] if unique_data_result else 0
                 unique_data_gb = round(unique_data_bytes / (1024 ** 3), 2)
                 
-                # Count total replicas across cluster
-                # (This counts ALL replica records for ALL chunks)
+                # Count total chunk locations across cluster
                 total_replicas = db.execute(
-                    text("SELECT COUNT(*) FROM replicas")
+                    text("SELECT COUNT(*) FROM chunk_locations")
                 ).fetchone()[0]
                 
                 # Count chunks
                 total_chunks = db.execute(
-                    text("SELECT COUNT(*) FROM chunks")
+                    text("SELECT COUNT(*) FROM file_chunks")
                 ).fetchone()[0]
                 
                 # Files count
                 file_count = db.query(FileModel).count()
                 
-                # Calculate actual storage used (replicas * chunk sizes)
+                # Calculate actual storage used (unique chunks * sizes on all nodes)
                 actual_storage_used = db.execute(
                     text("""
-                        SELECT COALESCE(SUM(c.size_bytes), 0)
-                        FROM replicas r
-                        JOIN chunks c ON r.chunk_id = c.id
+                        SELECT COALESCE(SUM(fc.size_bytes), 0)
+                        FROM chunk_locations cl
+                        JOIN (SELECT DISTINCT chunk_hash, size_bytes FROM file_chunks) fc 
+                          ON fc.chunk_hash = cl.chunk_hash
                     """)
                 ).fetchone()[0]
                 actual_storage_used_gb = round(actual_storage_used / (1024 ** 3), 2)
@@ -2977,10 +3043,18 @@ class TossItNode:
                 result = []
                 for f in files:
                     # Count unique nodes that have chunks of this file
-                    replicas_query = db.query(Replica.node_id).join(Chunk).filter(
-                        Chunk.file_id == f.id
-                    ).distinct()
-                    replica_count = replicas_query.count()
+                    file_chunks = db.query(FileChunk).filter(FileChunk.file_id == f.id).all()
+                    chunk_hashes = [fc.chunk_hash for fc in file_chunks]
+                    
+                    node_ids = set()
+                    if chunk_hashes:
+                        locations = db.query(ChunkLocation).filter(
+                            ChunkLocation.chunk_hash.in_(chunk_hashes)
+                        ).all()
+                        for loc in locations:
+                            node_ids.add(loc.node_id)
+                    
+                    replica_count = len(node_ids)
                     
                     result.append({
                         "id": f.id,
@@ -2990,7 +3064,7 @@ class TossItNode:
                         "total_size_mb": round(f.total_size_bytes / (1024**2), 2),
                         "total_chunks": f.total_chunks,
                         "is_complete": f.is_complete,
-                        "is_replicated": replica_count > 1,  # True if on multiple nodes
+                        "is_replicated": replica_count > 1,
                         "replica_count": replica_count,
                         "created_at": f.created_at.isoformat() if f.created_at else None,
                         "uploaded_by": f.uploaded_by
@@ -3002,55 +3076,48 @@ class TossItNode:
         
         @self.app.get("/api/files/{file_id}")
         async def get_file_details(file_id: int):
-            """Get single file details with replica locations"""
+            """Get single file details with chunk locations"""
             db = self.SessionLocal()
             try:
                 file = db.query(FileModel).filter(FileModel.id == file_id).first()
                 if not file:
                     raise HTTPException(status_code=404, detail="File not found")
                 
-                # Get chunks and their replicas
-                chunks = db.query(Chunk).filter(Chunk.file_id == file_id).order_by(Chunk.chunk_index).all()
+                file_chunks = db.query(FileChunk).filter(
+                    FileChunk.file_id == file_id
+                ).order_by(FileChunk.chunk_index).all()
                 
                 chunk_info = []
-                for chunk in chunks:
-                    replicas = db.query(Replica).filter(Replica.chunk_id == chunk.id).all()
+                all_node_ids = set()
+                
+                for fc in file_chunks:
+                    # Find all nodes that have this chunk
+                    locations = db.query(ChunkLocation).filter(
+                        ChunkLocation.chunk_hash == fc.chunk_hash
+                    ).all()
                     
-                    replica_info = []
-                    for replica in replicas:
-                        # Get node name if it's a known peer
+                    location_info = []
+                    for loc in locations:
                         node_name = "unknown"
-                        if replica.node_id == 1:
-                            node_name = self.config.node_name  # Self
+                        if loc.node_id == 1:
+                            node_name = self.config.node_name
                         else:
-                            # Try to find in peer_nodes
                             for peer_id, peer_info in self.peer_nodes.items():
-                                # Match by node_id stored in replica
-                                # Note: This is imperfect as node_id=1 for all nodes in their own DB
-                                # In future, use actual unique node_id
                                 node_name = "peer_node"
                                 break
                         
-                        replica_info.append({
-                            "node_id": replica.node_id,
+                        location_info.append({
+                            "node_id": loc.node_id,
                             "node_name": node_name,
-                            "is_primary": replica.is_primary,
-                            "verification_status": replica.verification_status
                         })
+                        all_node_ids.add(loc.node_id)
                     
                     chunk_info.append({
-                        "chunk_index": chunk.chunk_index,
-                        "size_bytes": chunk.size_bytes,
-                        "checksum": chunk.checksum_sha256[:16] + "...",
-                        "replicas": replica_info
+                        "chunk_index": fc.chunk_index,
+                        "size_bytes": fc.size_bytes,
+                        "chunk_hash": fc.chunk_hash[:16] + "...",
+                        "locations": location_info
                     })
-                
-                # Count unique nodes with any chunk
-                node_ids = set()
-                for chunk in chunks:
-                    replicas = db.query(Replica).filter(Replica.chunk_id == chunk.id).all()
-                    for replica in replicas:
-                        node_ids.add(replica.node_id)
                 
                 return {
                     "id": file.id,
@@ -3061,7 +3128,7 @@ class TossItNode:
                     "is_complete": file.is_complete,
                     "created_at": file.created_at.isoformat() if file.created_at else None,
                     "uploaded_by": file.uploaded_by,
-                    "replica_count": len(node_ids),
+                    "replica_count": len(all_node_ids),
                     "chunks": chunk_info
                 }
             finally:
@@ -3112,7 +3179,7 @@ class TossItNode:
                 }
             }
     
-    async def _delete_remote_replicas(self, file_id: int, chunk_count: int):
+    async def _delete_remote_replicas(self, file_id: int, chunk_count: int, chunk_hashes: list = None):
         """
         Send delete requests to all peer nodes to remove replicated chunks.
         Fire-and-forget with best-effort delivery.
@@ -3126,9 +3193,9 @@ class TossItNode:
             try:
                 target_url = f"http://{peer_info['ip_address']}:{peer_info['port']}/api/internal/delete_chunks"
                 
-                # Create signed delete request
                 delete_message = {
                     'file_id': file_id,
+                    'chunk_hashes': chunk_hashes or [],
                     'node_name': self.config.node_name,
                     'timestamp': time.time()
                 }
@@ -3274,13 +3341,14 @@ class TossItNode:
         """
         db = self.SessionLocal()
         try:
-            # Count ALL replicas on THIS node (each replica uses disk space)
+            # Count ALL unique chunks on THIS node
             result = db.execute(
                 text("""
-                    SELECT COALESCE(SUM(c.size_bytes), 0)
-                    FROM replicas r
-                    JOIN chunks c ON r.chunk_id = c.id
-                    WHERE r.node_id = 1
+                    SELECT COALESCE(SUM(fc.size_bytes), 0)
+                    FROM chunk_locations cl
+                    JOIN (SELECT DISTINCT chunk_hash, size_bytes FROM file_chunks) fc 
+                      ON fc.chunk_hash = cl.chunk_hash
+                    WHERE cl.node_id = 1
                 """)
             ).fetchone()
             

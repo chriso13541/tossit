@@ -1,187 +1,167 @@
+#!/usr/bin/env python3
 """
-TossIt Database Models
-Defines the schema for nodes, files, chunks, replicas, jobs, and audit logs
+TossIt Data Models — Content-Addressed Chunk Storage
+
+Architecture:
+  Files = logical objects (sequential ID, user-facing)
+  Chunks = content-addressed (SHA-256 hash IS the identity)
+  FileChunks = ordered mapping from files to chunks
+  ChunkLocations = which nodes have which chunks
+
+Key principle: chunk identity is its content hash, globally unique.
+Same data → same chunk_hash everywhere. Different data → different hash.
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, Enum
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
-from datetime import datetime
+from sqlalchemy import (
+    Column, Integer, String, Float, Boolean, DateTime, Enum as SQLEnum,
+    ForeignKey, UniqueConstraint, Index
+)
+from sqlalchemy.orm import declarative_base, relationship
+from datetime import datetime, timezone
 import enum
 
+
 Base = declarative_base()
+
+
+# ================================================================
+#  Enums
+# ================================================================
 
 class NodeStatus(enum.Enum):
     ONLINE = "online"
     OFFLINE = "offline"
-    DEGRADED = "degraded"
+    MAINTENANCE = "maintenance"
+
 
 class JobStatus(enum.Enum):
     PENDING = "pending"
-    IN_PROGRESS = "in_progress"
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
 
+
 class JobType(enum.Enum):
     REPLICATION = "replication"
-    VERIFICATION = "verification"
-    REBALANCE = "rebalance"
     DELETION = "deletion"
+    MIGRATION = "migration"
+
+
+# ================================================================
+#  Node — physical machine in the cluster
+# ================================================================
 
 class Node(Base):
     __tablename__ = 'nodes'
-    
+
     id = Column(Integer, primary_key=True)
-    name = Column(String(100), unique=True, nullable=False)
-    ip_address = Column(String(50), nullable=False)
-    port = Column(Integer, default=8080)
-    
-    # Capacity metrics
-    total_capacity_gb = Column(Float, nullable=False)
-    free_capacity_gb = Column(Float, nullable=False)
-    
-    # Performance metrics
-    cpu_score = Column(Float, default=1.0)  # Relative performance score
+    name = Column(String, nullable=False)
+    ip_address = Column(String, nullable=False)
+    port = Column(Integer, default=8000)
+    total_capacity_gb = Column(Float, default=0.0)
+    free_capacity_gb = Column(Float, default=0.0)
+    cpu_score = Column(Float, default=1.0)
     network_speed_mbps = Column(Float, default=100.0)
     avg_uptime_percent = Column(Float, default=100.0)
-    
-    # Priority calculation
-    priority_score = Column(Float, default=1.0)  # Computed from above metrics
-    
-    # Status
-    status = Column(Enum(NodeStatus), default=NodeStatus.ONLINE)
-    last_heartbeat = Column(DateTime, default=datetime.utcnow)
-    
-    # Metadata
-    is_brain = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # Relationships
-    replicas = relationship("Replica", back_populates="node", cascade="all, delete-orphan")
+    status = Column(SQLEnum(NodeStatus), default=NodeStatus.ONLINE)
+    last_heartbeat = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+# ================================================================
+#  File — logical file object (user-facing, sequential ID)
+# ================================================================
 
 class File(Base):
     __tablename__ = 'files'
-    
-    id = Column(Integer, primary_key=True)
-    filename = Column(String(500), nullable=False)
-    original_path = Column(String(1000))
-    
-    # File metadata
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    filename = Column(String, nullable=False)
     total_size_bytes = Column(Integer, nullable=False)
-    chunk_size_bytes = Column(Integer, default=67108864)  # 64 MB default
+    chunk_size_bytes = Column(Integer, default=64 * 1024 * 1024)
     total_chunks = Column(Integer, nullable=False)
-    
-    # File info
-    mime_type = Column(String(100))
-    checksum_sha256 = Column(String(64))  # Full file hash
-    
-    # Status
-    is_complete = Column(Boolean, default=False)  # All chunks uploaded
-    is_replicated = Column(Boolean, default=False)  # All chunks have min replicas
-    
-    # Metadata
-    uploaded_by = Column(String(100))
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    last_accessed = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationships
-    chunks = relationship("Chunk", back_populates="file", cascade="all, delete-orphan")
+    checksum_sha256 = Column(String, nullable=False)
+    is_complete = Column(Boolean, default=False)
+    is_replicated = Column(Boolean, default=False)
+    uploaded_by = Column(String, default='unknown')
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-class Chunk(Base):
-    __tablename__ = 'chunks'
-    
-    id = Column(Integer, primary_key=True)
-    file_id = Column(Integer, ForeignKey('files.id'), nullable=False)
-    chunk_index = Column(Integer, nullable=False)  # 0-based position in file
-    
-    # Chunk data
+    # Relationship to ordered chunks
+    chunks = relationship("FileChunk", back_populates="file",
+                          order_by="FileChunk.chunk_index",
+                          cascade="all, delete-orphan")
+
+
+# ================================================================
+#  FileChunk — ordered mapping from file to content-addressed chunks
+#
+#  This is the bridge between logical files and physical chunks.
+#  chunk_hash is the SHA-256 of the chunk bytes — the global identity.
+#  Multiple files can reference the same chunk_hash (deduplication).
+# ================================================================
+
+class FileChunk(Base):
+    __tablename__ = 'file_chunks'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    file_id = Column(Integer, ForeignKey('files.id', ondelete='CASCADE'), nullable=False)
+    chunk_index = Column(Integer, nullable=False)  # Position in file (0, 1, 2...)
+    chunk_hash = Column(String(64), nullable=False)  # SHA-256 content hash
     size_bytes = Column(Integer, nullable=False)
-    checksum_sha256 = Column(String(64), nullable=False)  # Chunk hash for verification
-    
-    # Primary replica tracking
-    primary_node_id = Column(Integer, ForeignKey('nodes.id'))
-    
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationships
-    file = relationship("File", back_populates="chunks")
-    replicas = relationship("Replica", back_populates="chunk", cascade="all, delete-orphan")
 
-class Replica(Base):
-    __tablename__ = 'replicas'
-    
-    id = Column(Integer, primary_key=True)
-    chunk_id = Column(Integer, ForeignKey('chunks.id'), nullable=False)
-    node_id = Column(Integer, ForeignKey('nodes.id'), nullable=False)
-    
-    # Replica metadata
-    is_primary = Column(Boolean, default=False)
-    local_path = Column(String(1000))  # Path on the node's filesystem
-    
-    # Verification
-    last_verified = Column(DateTime)
-    verification_status = Column(String(20), default="unverified")  # unverified, verified, corrupted
-    
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # Relationships
-    chunk = relationship("Chunk", back_populates="replicas")
-    node = relationship("Node", back_populates="replicas")
+    file = relationship("File", back_populates="chunks")
+
+    __table_args__ = (
+        UniqueConstraint('file_id', 'chunk_index', name='uq_file_chunk_index'),
+        Index('ix_file_chunks_hash', 'chunk_hash'),
+    )
+
+
+# ================================================================
+#  ChunkLocation — tracks which nodes store which chunks
+#
+#  chunk_hash references the content-addressed chunk.
+#  node_id = 1 means "this node" (same convention as before).
+#  A chunk is considered replicated if it appears on multiple node_ids.
+# ================================================================
+
+class ChunkLocation(Base):
+    __tablename__ = 'chunk_locations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chunk_hash = Column(String(64), nullable=False)
+    node_id = Column(Integer, nullable=False)  # 1 = self
+
+    __table_args__ = (
+        UniqueConstraint('chunk_hash', 'node_id', name='uq_chunk_node'),
+        Index('ix_chunk_locations_hash', 'chunk_hash'),
+    )
+
+
+# ================================================================
+#  Job / AuditLog — placeholders for future use
+# ================================================================
 
 class Job(Base):
     __tablename__ = 'jobs'
-    
-    id = Column(Integer, primary_key=True)
-    job_type = Column(Enum(JobType), nullable=False)
-    status = Column(Enum(JobStatus), default=JobStatus.PENDING)
-    
-    # Job targets
-    chunk_id = Column(Integer, ForeignKey('chunks.id'))
-    source_node_id = Column(Integer, ForeignKey('nodes.id'))
-    target_node_id = Column(Integer, ForeignKey('nodes.id'))
-    
-    # Progress tracking
-    progress_percent = Column(Float, default=0.0)
-    error_message = Column(Text)
-    retry_count = Column(Integer, default=0)
-    max_retries = Column(Integer, default=3)
-    
-    # Priority
-    priority = Column(Integer, default=5)  # 1-10, higher = more urgent
-    
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
-    started_at = Column(DateTime)
-    completed_at = Column(DateTime)
-    
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    type = Column(SQLEnum(JobType), nullable=False)
+    status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    completed_at = Column(DateTime, nullable=True)
+    details = Column(String, nullable=True)
+
+
 class AuditLog(Base):
     __tablename__ = 'audit_log'
-    
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    
-    # Event details
-    event_type = Column(String(50), nullable=False)  # upload, download, delete, replicate, etc.
-    node_id = Column(Integer, ForeignKey('nodes.id'))
-    file_id = Column(Integer, ForeignKey('files.id'))
-    chunk_id = Column(Integer, ForeignKey('chunks.id'))
-    
-    # Event data
-    details = Column(Text)  # JSON string with additional context
-    user = Column(String(100))
-    
-    # Result
-    success = Column(Boolean, default=True)
-    error_message = Column(Text)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    action = Column(String, nullable=False)
+    details = Column(String, nullable=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
-def init_database(db_path='tossit.db'):
-    """Initialize the database and create all tables"""
-    engine = create_engine(f'sqlite:///{db_path}')
-    Base.metadata.create_all(engine)
-    return engine
+# Legacy aliases — only used for clean import compatibility
+# New code should use FileChunk and ChunkLocation directly
+Chunk = FileChunk
+Replica = ChunkLocation
