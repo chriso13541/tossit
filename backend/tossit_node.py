@@ -605,6 +605,9 @@ class TossItNode:
             )
             self.registry_client.start_heartbeat()
             print(f"📡 Started registry heartbeat for cluster {self.config.cluster_id}")
+        
+        # Run metadata reconciliation in background (doesn't block uploads)
+        asyncio.create_task(self._reconcile_on_promotion())
     
     async def _on_lost_leadership(self):
         """Called when this node loses leadership"""
@@ -1197,6 +1200,242 @@ class TossItNode:
                 pass  # Fire and forget — counter will self-correct anyway
         except Exception:
             pass  # Not critical — health check will sync the counter
+    
+    async def _reconcile_on_promotion(self):
+        """
+        METADATA RECONCILIATION — run when this node becomes leader.
+        
+        When a leader dies, the new leader's DB may be missing metadata for
+        files that were:
+        - Uploaded directly to the old leader (not yet replicated)
+        - Assigned via delegation but only partially replicated
+        - In-flight when the old leader crashed
+        
+        Since files on disk are the real source of truth, we rebuild our
+        metadata by querying every peer's inventory and merging it with
+        our own database.
+        
+        Steps:
+        1. Clean stale delegation placeholders
+        2. Scan local disk for orphaned chunks
+        3. Query each peer's /api/inventory
+        4. Import metadata for files we don't know about
+        5. Trigger re-replication for under-replicated files
+        """
+        print()
+        print("=" * 60)
+        print("  🔄 METADATA RECONCILIATION — new leader recovery")
+        print("=" * 60)
+        
+        # Allow cluster to stabilize (peers need to recognize new leader)
+        await asyncio.sleep(3.0)
+        
+        if not self.raft or not self.raft.is_leader():
+            print("ℹ️  Lost leadership during reconciliation wait — aborting")
+            return
+        
+        # ========================================
+        # STEP 1: Clean stale delegation placeholders
+        # ========================================
+        async with self._db_write_semaphore:
+            db = self.SessionLocal()
+            try:
+                stale = db.query(FileModel).filter(
+                    FileModel.checksum_sha256 == "pending_delegation"
+                ).all()
+                
+                if stale:
+                    stale_ids = [f.id for f in stale]
+                    for f in stale:
+                        db.delete(f)
+                    await db_commit_with_retry(db)
+                    print(f"🧹 Step 1: Cleaned {len(stale)} stale delegation placeholders (IDs: {stale_ids})")
+                else:
+                    print(f"✓  Step 1: No stale delegation placeholders")
+            except Exception as e:
+                db.rollback()
+                print(f"⚠️  Step 1 failed: {e}")
+            finally:
+                db.close()
+        
+        # ========================================
+        # STEP 2: Scan local disk for orphaned chunks
+        # ========================================
+        import re
+        orphaned_files = {}  # file_id -> list of (chunk_index, size_bytes)
+        
+        for dat_file in self.config.storage_path.glob("file_*_chunk_*.dat"):
+            match = re.match(r'file_(\d+)_chunk_(\d+)\.dat', dat_file.name)
+            if match:
+                fid = int(match.group(1))
+                cidx = int(match.group(2))
+                
+                db = self.SessionLocal()
+                try:
+                    exists = db.query(Chunk).filter(
+                        Chunk.file_id == fid,
+                        Chunk.chunk_index == cidx
+                    ).first()
+                    if not exists:
+                        if fid not in orphaned_files:
+                            orphaned_files[fid] = []
+                        orphaned_files[fid].append((cidx, dat_file.stat().st_size))
+                finally:
+                    db.close()
+        
+        if orphaned_files:
+            total_orphans = sum(len(v) for v in orphaned_files.values())
+            print(f"🔍 Step 2: Found {total_orphans} orphaned chunks across {len(orphaned_files)} files on local disk")
+        else:
+            print(f"✓  Step 2: No orphaned chunks on local disk")
+        
+        # ========================================
+        # STEP 3: Query peer inventories
+        # ========================================
+        peer_inventories = {}  # node_id -> inventory response
+        
+        for node_id, peer_info in list(self.peer_nodes.items()):
+            if self.health_monitor:
+                status = self.health_monitor.get_peer_status(node_id)
+                # Also check heartbeat thread's liveness
+                if status != "online" and not (self.raft and self.raft.is_peer_alive(node_id)):
+                    continue
+            
+            peer_url = f"http://{peer_info['ip_address']}:{peer_info['port']}"
+            try:
+                session = await self._get_http_session()
+                async with session.get(
+                    f"{peer_url}/api/inventory",
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status == 200:
+                        inv = await resp.json()
+                        peer_inventories[node_id] = inv
+                        file_count = len(inv.get("files", []))
+                        print(f"📋 Step 3: {peer_info['node_name']} reports {file_count} files")
+                    else:
+                        print(f"⚠️  Step 3: {peer_info['node_name']} returned HTTP {resp.status}")
+            except Exception as e:
+                print(f"⚠️  Step 3: Failed to reach {peer_info['node_name']}: {e}")
+        
+        if not peer_inventories:
+            print("ℹ️  Step 3: No peer inventories available — reconciliation limited to local data")
+        
+        # ========================================
+        # STEP 4: Import metadata for unknown files
+        # ========================================
+        files_imported = 0
+        files_already_known = 0
+        
+        for node_id, inventory in peer_inventories.items():
+            peer_name = inventory.get("node_name", node_id[:8])
+            
+            for file_info in inventory.get("files", []):
+                file_id = file_info["file_id"]
+                
+                # Skip delegation placeholders on peers
+                if file_info.get("checksum_sha256") == "pending_delegation":
+                    continue
+                
+                # Skip incomplete files (partial uploads that never finished)
+                if not file_info.get("is_complete", False):
+                    continue
+                
+                # Check if we already know about this file
+                db = self.SessionLocal()
+                try:
+                    existing = db.query(FileModel).filter(FileModel.id == file_id).first()
+                    
+                    if existing and existing.checksum_sha256 != "pending_delegation":
+                        files_already_known += 1
+                        continue
+                    
+                    # Either doesn't exist or is a stale placeholder — create/update
+                    async with self._db_write_semaphore:
+                        db2 = self.SessionLocal()
+                        try:
+                            existing2 = db2.query(FileModel).filter(FileModel.id == file_id).first()
+                            
+                            if existing2:
+                                # Update placeholder with real data
+                                existing2.filename = file_info["filename"]
+                                existing2.total_size_bytes = file_info["total_size_bytes"]
+                                existing2.chunk_size_bytes = file_info.get("chunk_size_bytes", 64 * 1024 * 1024)
+                                existing2.total_chunks = file_info["total_chunks"]
+                                existing2.checksum_sha256 = file_info["checksum_sha256"]
+                                existing2.uploaded_by = file_info.get("uploaded_by", "reconciled")
+                                existing2.is_complete = True
+                                existing2.is_replicated = False  # Will trigger re-replication
+                            else:
+                                new_file = FileModel(
+                                    id=file_id,
+                                    filename=file_info["filename"],
+                                    total_size_bytes=file_info["total_size_bytes"],
+                                    chunk_size_bytes=file_info.get("chunk_size_bytes", 64 * 1024 * 1024),
+                                    total_chunks=file_info["total_chunks"],
+                                    checksum_sha256=file_info["checksum_sha256"],
+                                    uploaded_by=file_info.get("uploaded_by", "reconciled"),
+                                    is_complete=True,
+                                    is_replicated=False,
+                                )
+                                db2.add(new_file)
+                            
+                            await db_commit_with_retry(db2)
+                            files_imported += 1
+                            print(f"   📥 Imported: {file_info['filename']} (ID: {file_id}) from {peer_name}")
+                        except Exception as e:
+                            db2.rollback()
+                            print(f"   ⚠️  Failed to import file {file_id}: {e}")
+                        finally:
+                            db2.close()
+                finally:
+                    db.close()
+        
+        print(f"✓  Step 4: Imported {files_imported} files from peers ({files_already_known} already known)")
+        
+        # ========================================
+        # STEP 5: Trigger re-replication for files only on one node
+        # ========================================
+        if len(self.peer_nodes) > 0:
+            # Wait a moment for DB writes to settle
+            await asyncio.sleep(1.0)
+            
+            replication_needed = 0
+            db = self.SessionLocal()
+            try:
+                # Files marked as not replicated
+                unreplicated = db.query(FileModel).filter(
+                    FileModel.is_complete == True,
+                    FileModel.is_replicated == False,
+                ).all()
+                
+                for f in unreplicated:
+                    # Check if we have the chunks locally
+                    local_chunks = db.query(Chunk).filter(Chunk.file_id == f.id).count()
+                    has_local = local_chunks == f.total_chunks
+                    
+                    if has_local:
+                        # We have the file — replicate to peers
+                        asyncio.create_task(self._replicate_file_chunks(f.id))
+                        replication_needed += 1
+                    else:
+                        # File is on a peer but not here — request it via redistribution
+                        # This will be handled by _redistribute_existing_files
+                        replication_needed += 1
+            finally:
+                db.close()
+            
+            if replication_needed > 0:
+                print(f"🔄 Step 5: Triggered replication for {replication_needed} under-replicated files")
+            else:
+                print(f"✓  Step 5: All files properly replicated")
+        else:
+            print(f"ℹ️  Step 5: No peers — skipping replication check")
+        
+        print("=" * 60)
+        print("  ✅ RECONCILIATION COMPLETE")
+        print("=" * 60)
+        print()
     
     async def _redistribute_existing_files(self):
         """
@@ -2486,6 +2725,80 @@ class TossItNode:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
 
+        @self.app.get("/api/inventory")
+        async def get_inventory():
+            """
+            Lightweight file inventory for leader reconciliation.
+            
+            Returns every file this node physically has (complete or not),
+            with chunk-level checksums so the new leader can verify integrity
+            and detect partial uploads.
+            
+            Called by the new leader during _reconcile_on_promotion() to
+            rebuild global metadata from what each node actually stores.
+            """
+            db = self.SessionLocal()
+            try:
+                files = db.query(FileModel).all()
+                inventory = []
+                
+                for f in files:
+                    chunks = db.query(Chunk).filter(
+                        Chunk.file_id == f.id
+                    ).order_by(Chunk.chunk_index).all()
+                    
+                    # Verify chunks actually exist on disk
+                    chunks_on_disk = []
+                    for c in chunks:
+                        chunk_path = self.config.storage_path / f"file_{f.id}_chunk_{c.chunk_index}.dat"
+                        if chunk_path.exists():
+                            chunks_on_disk.append({
+                                "chunk_index": c.chunk_index,
+                                "size_bytes": c.size_bytes,
+                                "checksum_sha256": c.checksum_sha256,
+                            })
+                    
+                    inventory.append({
+                        "file_id": f.id,
+                        "filename": f.filename,
+                        "total_size_bytes": f.total_size_bytes,
+                        "chunk_size_bytes": f.chunk_size_bytes,
+                        "total_chunks": f.total_chunks,
+                        "checksum_sha256": f.checksum_sha256,
+                        "is_complete": f.is_complete,
+                        "uploaded_by": f.uploaded_by,
+                        "chunks_on_disk": chunks_on_disk,
+                    })
+                
+                # Also scan disk for orphaned chunks (on disk but not in DB)
+                import re
+                orphans = []
+                for dat_file in self.config.storage_path.glob("file_*_chunk_*.dat"):
+                    match = re.match(r'file_(\d+)_chunk_(\d+)\.dat', dat_file.name)
+                    if match:
+                        fid = int(match.group(1))
+                        cidx = int(match.group(2))
+                        # Check if this chunk is in the DB
+                        exists = db.query(Chunk).filter(
+                            Chunk.file_id == fid,
+                            Chunk.chunk_index == cidx
+                        ).first()
+                        if not exists:
+                            orphans.append({
+                                "file_id": fid,
+                                "chunk_index": cidx,
+                                "size_bytes": dat_file.stat().st_size,
+                            })
+                
+                return {
+                    "node_id": self.node_id,
+                    "node_name": self.config.node_name,
+                    "files": inventory,
+                    "orphaned_chunks": orphans,
+                }
+            finally:
+                db.close()
+
         @self.app.get("/api/cluster/stats")
         async def get_stats():
             db = self.SessionLocal()
@@ -2855,6 +3168,7 @@ class TossItNode:
             node_id=self.node_id,  # Use cryptographic node ID
             node_name=self.config.node_name,
             port=self.config.port,  # UDP heartbeat will use port+1
+            data_dir=str(DB_DIR),   # Persist term/voted_for alongside DB
             identity=self.identity,  # Pass identity for signing messages
             trust_store=self.trust_store,  # Pass trust store for verification
             on_become_leader=self._on_became_leader,

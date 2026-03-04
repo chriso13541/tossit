@@ -58,6 +58,7 @@ class ClusterRaft:
         node_id: str,
         node_name: str,
         port: int = 8000,
+        data_dir: Optional[str] = None,
         identity=None,
         trust_store=None,
         on_become_leader: Optional[Callable] = None,
@@ -79,11 +80,23 @@ class ClusterRaft:
         self.on_become_leader = on_become_leader
         self.on_lose_leadership = on_lose_leadership
         
+        # Raft state persistence — survive crashes without violating safety.
+        # Without this, a restarted node could vote twice in the same term.
+        self._state_file = None
+        if data_dir:
+            import pathlib
+            state_dir = pathlib.Path(data_dir)
+            state_dir.mkdir(parents=True, exist_ok=True)
+            self._state_file = state_dir / "raft_state.json"
+        
         # Raft state (shared between threads — GIL-safe for simple attrs)
         self.state = NodeState.FOLLOWER
         self.current_term = 0
         self.voted_for: Optional[str] = None
         self.leader_id: Optional[str] = None
+        
+        # Restore persisted state from disk (if any)
+        self._load_persisted_state()
         
         # Known peers
         self.peers: Dict[str, dict] = {}
@@ -113,7 +126,7 @@ class ClusterRaft:
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self.running = False
         
-        print(f"🗳️  Raft initialized for {node_name} (timeout: {election_timeout_min}-{election_timeout_max}s, UDP port: {self.udp_port})")
+        print(f"🗳️  Raft initialized for {node_name} (term={self.current_term}, timeout: {election_timeout_min}-{election_timeout_max}s, UDP port: {self.udp_port})")
     
     async def start(self):
         """Start Raft — opens UDP socket and launches heartbeat thread"""
@@ -161,6 +174,51 @@ class ClusterRaft:
             print("📊 No peers at startup — becoming leader")
             if self._main_loop and self._main_loop.is_running():
                 asyncio.run_coroutine_threadsafe(self._become_leader(), self._main_loop)
+    
+    # ================================================================
+    #  STATE PERSISTENCE — survive crashes without safety violations
+    # ================================================================
+    
+    def _persist_state(self):
+        """
+        Persist current_term and voted_for to disk.
+        
+        Called every time either value changes. This is the minimum state
+        needed for Raft safety: without it, a restarted node could vote
+        twice in the same term, violating the one-vote-per-term guarantee.
+        
+        The write is ~50 bytes to a small JSON file. Even on a busy disk
+        this completes in <1ms. It runs in the heartbeat thread so it
+        doesn't touch the event loop.
+        """
+        if not self._state_file:
+            return
+        
+        try:
+            state = {
+                "current_term": self.current_term,
+                "voted_for": self.voted_for,
+            }
+            # Atomic write: write to temp file, then rename.
+            # Prevents corrupt state if crash occurs mid-write.
+            tmp = self._state_file.with_suffix('.tmp')
+            tmp.write_text(json.dumps(state))
+            tmp.rename(self._state_file)
+        except Exception as e:
+            print(f"⚠️  Failed to persist Raft state: {e}")
+    
+    def _load_persisted_state(self):
+        """Load persisted term/vote from disk on startup."""
+        if not self._state_file or not self._state_file.exists():
+            return
+        
+        try:
+            state = json.loads(self._state_file.read_text())
+            self.current_term = state.get("current_term", 0)
+            self.voted_for = state.get("voted_for", None)
+            print(f"📂 Restored Raft state: term={self.current_term}, voted_for={self.voted_for}")
+        except Exception as e:
+            print(f"⚠️  Failed to load Raft state (starting fresh): {e}")
     
     # ================================================================
     #  HEARTBEAT THREAD — fully independent of asyncio event loop
@@ -273,6 +331,7 @@ class ClusterRaft:
             if term > self.current_term:
                 self.current_term = term
                 self.leader_id = sender_id
+                self._persist_state()
                 
         except socket.timeout:
             pass  # No UDP heartbeat received — election check will handle it
@@ -308,6 +367,7 @@ class ClusterRaft:
         self.current_term += 1
         self.voted_for = self.node_id
         self.leader_id = None
+        self._persist_state()  # Persist before requesting votes
         
         print(f"📢 Starting election for term {self.current_term}")
         
@@ -397,6 +457,7 @@ class ClusterRaft:
         if term > self.current_term:
             self.current_term = term
             self.voted_for = None
+            self._persist_state()
             if self.state != NodeState.FOLLOWER:
                 await self._become_follower()
         
@@ -418,11 +479,13 @@ class ClusterRaft:
         if term > self.current_term:
             self.current_term = term
             self.voted_for = None
+            self._persist_state()
             await self._become_follower()
         
         if self.voted_for is None or self.voted_for == candidate_id:
             self.voted_for = candidate_id
             self.last_heartbeat = time.time()
+            self._persist_state()  # Persist vote before confirming
             print(f"🗳️  Voted for {candidate_id} in term {term}")
             return True
         
