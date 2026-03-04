@@ -86,7 +86,7 @@ async def db_flush_with_retry(db, max_retries=5, base_delay=0.05):
             raise
 
 from models import (
-    Base, Node, File as FileModel, FileChunk, ChunkLocation, Job, AuditLog,
+    Base, Node, File as FileModel, Chunk, FileChunk, ChunkLocation, Job, AuditLog,
     NodeStatus, JobStatus, JobType
 )
 
@@ -712,6 +712,147 @@ class TossItNode:
         self.total_capacity_gb = self.config.storage_limit_gb
         self.used_capacity_gb = min(used_gb, self.config.storage_limit_gb)
         self.free_capacity_gb = self.config.storage_limit_gb - self.used_capacity_gb
+    
+    def _ensure_chunk(self, db, chunk_hash: str, size_bytes: int, increment_ref: bool = True):
+        """
+        Ensure a Chunk row exists for the given hash. Insert-if-not-exists.
+        
+        This is the atomic guard against concurrent uploads of identical data.
+        The Chunk table is the canonical record of chunk existence — FileChunk
+        and ChunkLocation both FK to it.
+        
+        Args:
+            db: Active SQLAlchemy session (caller handles commit)
+            chunk_hash: SHA-256 hex of chunk bytes
+            size_bytes: Chunk size (only used on first insert)
+            increment_ref: If True and chunk already exists, bump refcount.
+                           Set False when adding ChunkLocations without new FileChunks.
+        
+        Returns:
+            The Chunk ORM object (existing or newly created)
+        """
+        existing = db.query(Chunk).filter(Chunk.chunk_hash == chunk_hash).first()
+        if existing:
+            if increment_ref:
+                existing.refcount += 1
+            return existing
+        
+        chunk = Chunk(
+            chunk_hash=chunk_hash,
+            size_bytes=size_bytes,
+            refcount=1,
+        )
+        db.add(chunk)
+        return chunk
+    
+    def _decrement_chunk_ref(self, db, chunk_hash: str) -> bool:
+        """
+        Decrement a chunk's refcount. If it hits 0, delete the Chunk row
+        (cascades to ChunkLocations) and remove the physical file from disk.
+        
+        Returns:
+            True if chunk was garbage collected, False if still referenced.
+        """
+        chunk = db.query(Chunk).filter(Chunk.chunk_hash == chunk_hash).first()
+        if not chunk:
+            return False
+        
+        chunk.refcount -= 1
+        
+        if chunk.refcount <= 0:
+            # No more references — garbage collect
+            chunk_path = self.chunks_dir / f"{chunk_hash}.dat"
+            if chunk_path.exists():
+                chunk_path.unlink()
+            db.delete(chunk)  # Cascades to ChunkLocations
+            return True
+        
+        return False
+    
+    async def _verify_chunks_on_boot(self):
+        """
+        Integrity verification — run once on startup.
+        
+        Since chunks are content-addressed, filename == SHA-256 hash of contents.
+        We can verify every chunk on disk by rehashing and comparing.
+        
+        Actions:
+        1. Scan chunks/ dir, verify hash matches filename
+        2. Remove corrupt files from disk
+        3. Remove DB entries for chunks missing from disk
+        4. Remove orphaned ChunkLocations pointing to missing chunks
+        
+        This prevents silent corruption from becoming a data integrity problem
+        when chunks are replicated to other nodes.
+        """
+        if not self.chunks_dir.exists():
+            return
+        
+        print("🔍 Verifying chunk integrity on boot...")
+        
+        verified = 0
+        corrupt = 0
+        missing_from_disk = 0
+        
+        # Phase 1: Verify physical chunks match their content hash
+        for dat_file in self.chunks_dir.glob("*.dat"):
+            expected_hash = dat_file.stem
+            if len(expected_hash) != 64:
+                continue  # Not a valid chunk file
+            
+            try:
+                actual_hash = await asyncio.to_thread(
+                    lambda p=dat_file: hashlib.sha256(p.read_bytes()).hexdigest()
+                )
+                
+                if actual_hash != expected_hash:
+                    corrupt += 1
+                    print(f"   ❌ Corrupt chunk: {expected_hash[:12]}... (actual: {actual_hash[:12]}...)")
+                    dat_file.unlink()
+                    
+                    # Remove DB records for this corrupt chunk
+                    db = self.SessionLocal()
+                    try:
+                        db.query(ChunkLocation).filter(
+                            ChunkLocation.chunk_hash == expected_hash,
+                            ChunkLocation.node_id == self.node_id
+                        ).delete()
+                        db.query(Chunk).filter(Chunk.chunk_hash == expected_hash).delete()
+                        db.commit()
+                    finally:
+                        db.close()
+                else:
+                    verified += 1
+            except Exception as e:
+                corrupt += 1
+                print(f"   ❌ Unreadable chunk: {expected_hash[:12]}... ({e})")
+                try:
+                    dat_file.unlink()
+                except Exception:
+                    pass
+        
+        # Phase 2: Check DB entries have corresponding files on disk
+        db = self.SessionLocal()
+        try:
+            local_locations = db.query(ChunkLocation).filter(
+                ChunkLocation.node_id == self.node_id
+            ).all()
+            
+            for loc in local_locations:
+                chunk_path = self.chunks_dir / f"{loc.chunk_hash}.dat"
+                if not chunk_path.exists():
+                    missing_from_disk += 1
+                    db.delete(loc)
+            
+            if missing_from_disk > 0:
+                db.commit()
+        finally:
+            db.close()
+        
+        if corrupt > 0 or missing_from_disk > 0:
+            print(f"🔍 Integrity check: {verified} OK, {corrupt} corrupt (removed), {missing_from_disk} missing from disk (cleaned)")
+        else:
+            print(f"✓  Integrity check: {verified} chunks verified OK")
     
     
     async def _write_chunk_to_disk(
@@ -1409,6 +1550,12 @@ class TossItNode:
                             # Without these, the file exists in metadata but has no
                             # chunk references — it can't be downloaded or replicated.
                             for chunk_info in file_info.get("chunks_on_disk", []):
+                                # Ensure canonical Chunk record exists
+                                self._ensure_chunk(
+                                    db2, chunk_info["chunk_hash"],
+                                    chunk_info["size_bytes"]
+                                )
+                                
                                 existing_fc = db2.query(FileChunk).filter(
                                     FileChunk.file_id == file_id,
                                     FileChunk.chunk_index == chunk_info["chunk_index"]
@@ -1419,7 +1566,6 @@ class TossItNode:
                                         file_id=file_id,
                                         chunk_index=chunk_info["chunk_index"],
                                         chunk_hash=chunk_info["chunk_hash"],
-                                        size_bytes=chunk_info["size_bytes"],
                                     )
                                     db2.add(fc)
                             
@@ -2079,12 +2225,14 @@ class TossItNode:
                         file_id = file_record.id
                         
                         for meta in chunk_meta_list:
+                            # Canonical Chunk record (insert-if-not-exists, manages refcount)
+                            self._ensure_chunk(db, meta['chunk_hash'], meta['size_bytes'])
+                            
                             # FileChunk: ordered mapping from file → content-addressed chunk
                             file_chunk = FileChunk(
                                 file_id=file_id,
                                 chunk_index=meta['chunk_index'],
                                 chunk_hash=meta['chunk_hash'],
-                                size_bytes=meta['size_bytes'],
                             )
                             db.add(file_chunk)
                             
@@ -2092,12 +2240,12 @@ class TossItNode:
                             # Only add if not already tracked (dedup)
                             existing_loc = db.query(ChunkLocation).filter(
                                 ChunkLocation.chunk_hash == meta['chunk_hash'],
-                                ChunkLocation.node_id == 1
+                                ChunkLocation.node_id == self.node_id
                             ).first()
                             if not existing_loc:
                                 location = ChunkLocation(
                                     chunk_hash=meta['chunk_hash'],
-                                    node_id=1,
+                                    node_id=self.node_id,
                                 )
                                 db.add(location)
                         
@@ -2295,12 +2443,14 @@ class TossItNode:
                     # Content hash = chunk identity
                     chunk_checksum = hashlib.sha256(chunk_data).hexdigest()
                     
+                    # Canonical Chunk record (insert-if-not-exists, manages refcount)
+                    self._ensure_chunk(db, chunk_checksum, chunk_size)
+                    
                     # Create FileChunk mapping
                     file_chunk = FileChunk(
                         file_id=file_record.id,
                         chunk_index=chunk_index,
                         chunk_hash=chunk_checksum,
-                        size_bytes=chunk_size,
                     )
                     db.add(file_chunk)
                     
@@ -2334,12 +2484,12 @@ class TossItNode:
                     # Track chunk location on this node
                     existing_loc = db.query(ChunkLocation).filter(
                         ChunkLocation.chunk_hash == chunk_checksum,
-                        ChunkLocation.node_id == 1
+                        ChunkLocation.node_id == self.node_id
                     ).first()
                     if not existing_loc:
                         location = ChunkLocation(
                             chunk_hash=chunk_checksum,
-                            node_id=1,
+                            node_id=self.node_id,
                         )
                         db.add(location)
                     
@@ -2379,7 +2529,7 @@ class TossItNode:
                     "chunks": [
                         {
                             "chunk_index": c.chunk_index,
-                            "size_bytes": c.size_bytes,
+                            "size_bytes": c.chunk.size_bytes if c.chunk else 0,
                             "checksum": c.chunk_hash
                         }
                         for c in chunk_records
@@ -2403,15 +2553,16 @@ class TossItNode:
                 print(f"   Space reservation released: {file_size_gb:.2f}GB refunded")
                 
                 # CLEANUP: Delete physical chunk files that were written
-                # Only delete if no other file references this chunk (dedup safety)
+                # Only delete if no Chunk record exists (our insert was rolled back,
+                # and no prior upload created this chunk)
                 for chunk_path in chunk_paths:
                     try:
                         if chunk_path.exists():
                             chunk_hash = chunk_path.stem
-                            refs = db.query(FileChunk).filter(
-                                FileChunk.chunk_hash == chunk_hash
-                            ).count()
-                            if refs == 0:
+                            existing = db.query(Chunk).filter(
+                                Chunk.chunk_hash == chunk_hash
+                            ).first()
+                            if not existing:
                                 chunk_path.unlink()
                                 print(f"   Cleaned up: {chunk_path.name}")
                             else:
@@ -2524,6 +2675,10 @@ class TossItNode:
                         print(f"⚠️  Chunk {chunk_index} for file {file_id}: no file record yet, requesting retry with metadata")
                         raise HTTPException(409, f"File record {file_id} not found - retry with file_metadata")
                     
+                    # Canonical Chunk record (insert-if-not-exists)
+                    # increment_ref=False because replication doesn't create new file references
+                    self._ensure_chunk(db, chunk_checksum, len(chunk_data), increment_ref=False)
+                    
                     # Create FileChunk mapping (if not already present)
                     existing_fc = db.query(FileChunk).filter(
                         FileChunk.file_id == file_id,
@@ -2535,20 +2690,19 @@ class TossItNode:
                             file_id=file_id,
                             chunk_index=chunk_index,
                             chunk_hash=chunk_checksum,
-                            size_bytes=len(chunk_data),
                         )
                         db.add(file_chunk)
                     
                     # Track chunk location on this node (dedup-safe)
                     existing_loc = db.query(ChunkLocation).filter(
                         ChunkLocation.chunk_hash == chunk_checksum,
-                        ChunkLocation.node_id == 1
+                        ChunkLocation.node_id == self.node_id
                     ).first()
                     
                     if not existing_loc:
                         location = ChunkLocation(
                             chunk_hash=chunk_checksum,
-                            node_id=1,
+                            node_id=self.node_id,
                         )
                         db.add(location)
                     
@@ -2670,36 +2824,23 @@ class TossItNode:
                 
                 filename = file_record.filename
                 
-                # Delete legacy complete file if it exists
-                complete_file_path = self.config.storage_path / f"file_{file_id}.dat"
-                if complete_file_path.exists():
-                    complete_file_path.unlink()
-                
                 # Get chunk hashes before deleting the file record
                 file_chunks = db.query(FileChunk).filter(FileChunk.file_id == file_id).all()
                 chunk_hashes = [fc.chunk_hash for fc in file_chunks]
                 
                 # Delete file record (cascades to file_chunks)
                 db.delete(file_record)
-                await db_commit_with_retry(db)
+                await db_flush_with_retry(db)
                 
-                # Only delete chunk files that are no longer referenced by ANY file
-                orphaned_count = 0
+                # Decrement refcount on each chunk — GC if unreferenced
+                gc_count = 0
                 for ch in chunk_hashes:
-                    # Check if any other file still references this chunk
-                    refs = db.query(FileChunk).filter(FileChunk.chunk_hash == ch).count()
-                    if refs == 0:
-                        # No references — safe to delete from disk and location table
-                        chunk_path = self.chunks_dir / f"{ch}.dat"
-                        if chunk_path.exists():
-                            chunk_path.unlink()
-                            orphaned_count += 1
-                        
-                        db.query(ChunkLocation).filter(ChunkLocation.chunk_hash == ch).delete()
+                    if self._decrement_chunk_ref(db, ch):
+                        gc_count += 1
                 
                 await db_commit_with_retry(db)
                 
-                print(f"🗑️  Deleted: {filename} (ID: {file_id}, {len(chunk_hashes)} mappings, {orphaned_count} chunks removed from disk)")
+                print(f"🗑️  Deleted: {filename} (ID: {file_id}, {len(chunk_hashes)} mappings, {gc_count} chunks garbage collected)")
                 
                 # Clean up replicas on peer nodes (fire-and-forget)
                 if self.peer_nodes:
@@ -2728,27 +2869,25 @@ class TossItNode:
                     if file_id is None:
                         raise HTTPException(400, "Missing file_id")
                 
-                # Delete file record and mappings
+                # Get chunk hashes BEFORE deleting file (cascade removes FileChunks)
                 file_record = db.query(FileModel).filter(FileModel.id == file_id).first()
                 if file_record:
+                    file_chunks = db.query(FileChunk).filter(FileChunk.file_id == file_id).all()
+                    file_chunk_hashes = [fc.chunk_hash for fc in file_chunks]
+                    
+                    # Delete file record (cascades to file_chunks)
                     db.delete(file_record)
-                    await db_commit_with_retry(db)
-                
-                # Delete chunk files only if unreferenced
-                deleted_count = 0
-                for ch in chunk_hashes:
-                    refs = db.query(FileChunk).filter(FileChunk.chunk_hash == ch).count()
-                    if refs == 0:
-                        chunk_path = self.chunks_dir / f"{ch}.dat"
-                        if chunk_path.exists():
-                            chunk_path.unlink()
+                    await db_flush_with_retry(db)
+                    
+                    # Decrement refcount on each chunk — GC if unreferenced
+                    deleted_count = 0
+                    for ch in file_chunk_hashes:
+                        if self._decrement_chunk_ref(db, ch):
                             deleted_count += 1
-                        db.query(ChunkLocation).filter(
-                            ChunkLocation.chunk_hash == ch,
-                            ChunkLocation.node_id == 1
-                        ).delete()
-                
-                await db_commit_with_retry(db)
+                    
+                    await db_commit_with_retry(db)
+                else:
+                    deleted_count = 0
                 
                 print(f"🗑️  Deleted remote replicas: file {file_id} ({deleted_count} chunks removed)")
                 return {"status": "ok", "deleted_chunks": deleted_count}
@@ -2820,9 +2959,10 @@ class TossItNode:
                             # Check legacy path
                             chunk_path = self.config.storage_path / f"file_{f.id}_chunk_{fc.chunk_index}.dat"
                         if chunk_path.exists():
+                            chunk_record = db.query(Chunk).filter(Chunk.chunk_hash == fc.chunk_hash).first()
                             chunks_on_disk.append({
                                 "chunk_index": fc.chunk_index,
-                                "size_bytes": fc.size_bytes,
+                                "size_bytes": chunk_record.size_bytes if chunk_record else chunk_path.stat().st_size,
                                 "chunk_hash": fc.chunk_hash,
                             })
                     
@@ -2927,10 +3067,9 @@ class TossItNode:
                 # Calculate actual storage used (unique chunks * sizes on all nodes)
                 actual_storage_used = db.execute(
                     text("""
-                        SELECT COALESCE(SUM(fc.size_bytes), 0)
+                        SELECT COALESCE(SUM(c.size_bytes), 0)
                         FROM chunk_locations cl
-                        JOIN (SELECT DISTINCT chunk_hash, size_bytes FROM file_chunks) fc 
-                          ON fc.chunk_hash = cl.chunk_hash
+                        JOIN chunks c ON c.chunk_hash = cl.chunk_hash
                     """)
                 ).fetchone()[0]
                 actual_storage_used_gb = round(actual_storage_used / (1024 ** 3), 2)
@@ -3099,22 +3238,27 @@ class TossItNode:
                     location_info = []
                     for loc in locations:
                         node_name = "unknown"
-                        if loc.node_id == 1:
+                        if loc.node_id == self.node_id:
                             node_name = self.config.node_name
                         else:
                             for peer_id, peer_info in self.peer_nodes.items():
-                                node_name = "peer_node"
-                                break
+                                if peer_id == loc.node_id:
+                                    node_name = peer_info.get('node_name', 'peer_node')
+                                    break
                         
                         location_info.append({
-                            "node_id": loc.node_id,
+                            "node_id": loc.node_id[:12] + "..." if len(loc.node_id) > 12 else loc.node_id,
                             "node_name": node_name,
                         })
                         all_node_ids.add(loc.node_id)
                     
+                    # Get size from canonical Chunk record
+                    chunk_record = db.query(Chunk).filter(Chunk.chunk_hash == fc.chunk_hash).first()
+                    chunk_size = chunk_record.size_bytes if chunk_record else 0
+                    
                     chunk_info.append({
                         "chunk_index": fc.chunk_index,
-                        "size_bytes": fc.size_bytes,
+                        "size_bytes": chunk_size,
                         "chunk_hash": fc.chunk_hash[:16] + "...",
                         "locations": location_info
                     })
@@ -3230,6 +3374,9 @@ class TossItNode:
         print("="*60)
         print()
         
+        # Verify chunk integrity before accepting any traffic
+        await self._verify_chunks_on_boot()
+        
         # Start Raft for leader election
         self.raft = ClusterRaft(
             node_id=self.node_id,  # Use cryptographic node ID
@@ -3344,12 +3491,12 @@ class TossItNode:
             # Count ALL unique chunks on THIS node
             result = db.execute(
                 text("""
-                    SELECT COALESCE(SUM(fc.size_bytes), 0)
+                    SELECT COALESCE(SUM(c.size_bytes), 0)
                     FROM chunk_locations cl
-                    JOIN (SELECT DISTINCT chunk_hash, size_bytes FROM file_chunks) fc 
-                      ON fc.chunk_hash = cl.chunk_hash
-                    WHERE cl.node_id = 1
-                """)
+                    JOIN chunks c ON c.chunk_hash = cl.chunk_hash
+                    WHERE cl.node_id = :nid
+                """),
+                {"nid": self.node_id}
             ).fetchone()
             
             if result:

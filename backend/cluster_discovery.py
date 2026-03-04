@@ -59,7 +59,7 @@ class ClusterDiscovery:
         
     async def start(self):
         """Start broadcasting and listening for other nodes"""
-        print(f"🔍 Starting cluster discovery for cluster: {self.cluster_id}")
+        print(f"Starting cluster discovery for cluster: {self.cluster_id}")
         
         # Initialize zeroconf
         self.aiozc = AsyncZeroconf()
@@ -70,11 +70,11 @@ class ClusterDiscovery:
         # Start browsing for other nodes
         await self._start_browser()
         
-        print(f"✓ Discovery active - broadcasting as {self.node_name}")
+        print(f"Discovery active - broadcasting as {self.node_name}")
     
     async def stop(self):
         """Stop discovery and unregister service"""
-        print("🛑 Stopping cluster discovery...")
+        print("Stopping cluster discovery...")
         
         if self.browser:
             await self.browser.async_cancel()
@@ -155,7 +155,7 @@ class ClusterDiscovery:
             if info:
                 await self._handle_service_added(info)
         except Exception as e:
-            print(f"⚠️  Error getting service info: {e}")
+            print(f"Error getting service info: {e}")
     
     async def _handle_service_added(self, info: ServiceInfo):
         """Handle discovered service"""
@@ -209,7 +209,7 @@ class ClusterDiscovery:
                 self.discovered_nodes[discovered_node_id].update(node_info)
         
         except Exception as e:
-            print(f"⚠️  Error handling discovered service: {e}")
+            print(f"Error handling discovered service: {e}")
     
     async def _handle_service_removed(self, name: str):
         """Handle service that disappeared"""
@@ -217,7 +217,7 @@ class ClusterDiscovery:
             # Find which node this was
             for node_id, info in list(self.discovered_nodes.items()):
                 if info.get('service_name') == name:
-                    print(f"👋 Node left: {info['node_name']}")
+                    print(f"Node left: {info['node_name']}")
                     del self.discovered_nodes[node_id]
                     
                     # Callback
@@ -226,7 +226,7 @@ class ClusterDiscovery:
                     break
         
         except Exception as e:
-            print(f"⚠️  Error handling removed service: {e}")
+            print(f"Error handling removed service: {e}")
     
     def get_discovered_nodes(self) -> Dict[str, dict]:
         """Get all currently discovered nodes"""
@@ -273,7 +273,7 @@ async def main():
         while True:
             await asyncio.sleep(5)
             nodes = discovery.get_discovered_nodes()
-            print(f"📊 Currently discovered nodes: {len(nodes)}")
+            print(f"Currently discovered nodes: {len(nodes)}")
             for node_id, info in nodes.items():
                 print(f"  - {info['node_name']} ({info['ip_address']}:{info['port']})")
     except KeyboardInterrupt:

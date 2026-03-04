@@ -3,13 +3,18 @@
 TossIt Data Models — Content-Addressed Chunk Storage
 
 Architecture:
-  Files = logical objects (sequential ID, user-facing)
-  Chunks = content-addressed (SHA-256 hash IS the identity)
-  FileChunks = ordered mapping from files to chunks
-  ChunkLocations = which nodes have which chunks
+  Files   = logical objects (sequential ID, user-facing)
+  Chunks  = canonical content-addressed blobs (SHA-256 PK, single source of truth)
+  FileChunks    = ordered mapping from files → chunks
+  ChunkLocations = which nodes physically store which chunks
 
-Key principle: chunk identity is its content hash, globally unique.
-Same data → same chunk_hash everywhere. Different data → different hash.
+Key principles:
+  - Chunk identity IS its content hash, globally unique and immutable.
+  - Same data → same chunk_hash everywhere. Different data → different hash.
+  - The Chunk table is the authoritative record of chunk existence.
+  - FileChunk and ChunkLocation both FK to Chunk.chunk_hash.
+  - node_id is always the node's cryptographic ID (Ed25519 public key hash),
+    never a hardcoded integer. "self" is determined at runtime.
 """
 
 from sqlalchemy import (
@@ -85,17 +90,45 @@ class File(Base):
     uploaded_by = Column(String, default='unknown')
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-    # Relationship to ordered chunks
-    chunks = relationship("FileChunk", back_populates="file",
-                          order_by="FileChunk.chunk_index",
-                          cascade="all, delete-orphan")
+    # Relationship to ordered chunk mappings
+    chunk_mappings = relationship("FileChunk", back_populates="file",
+                                  order_by="FileChunk.chunk_index",
+                                  cascade="all, delete-orphan")
+
+
+# ================================================================
+#  Chunk — canonical content-addressed blob
+#
+#  The PRIMARY KEY is the SHA-256 hash of the chunk bytes.
+#  This is the single source of truth for chunk existence.
+#  Every FileChunk and ChunkLocation points here via FK.
+#
+#  refcount is maintained by the application layer:
+#    incremented when a new FileChunk references this hash,
+#    decremented when a FileChunk is removed (file deletion).
+#  When refcount hits 0, the chunk is eligible for garbage collection
+#  (physical deletion from disk + row removal).
+# ================================================================
+
+class Chunk(Base):
+    __tablename__ = 'chunks'
+
+    chunk_hash = Column(String(64), primary_key=True)  # SHA-256 hex
+    size_bytes = Column(Integer, nullable=False)
+    refcount = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    # Relationships
+    file_mappings = relationship("FileChunk", back_populates="chunk")
+    locations = relationship("ChunkLocation", back_populates="chunk",
+                             cascade="all, delete-orphan")
 
 
 # ================================================================
 #  FileChunk — ordered mapping from file to content-addressed chunks
 #
 #  This is the bridge between logical files and physical chunks.
-#  chunk_hash is the SHA-256 of the chunk bytes — the global identity.
+#  chunk_hash FKs to Chunk.chunk_hash — the canonical record.
 #  Multiple files can reference the same chunk_hash (deduplication).
 # ================================================================
 
@@ -105,10 +138,10 @@ class FileChunk(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     file_id = Column(Integer, ForeignKey('files.id', ondelete='CASCADE'), nullable=False)
     chunk_index = Column(Integer, nullable=False)  # Position in file (0, 1, 2...)
-    chunk_hash = Column(String(64), nullable=False)  # SHA-256 content hash
-    size_bytes = Column(Integer, nullable=False)
+    chunk_hash = Column(String(64), ForeignKey('chunks.chunk_hash'), nullable=False)
 
-    file = relationship("File", back_populates="chunks")
+    file = relationship("File", back_populates="chunk_mappings")
+    chunk = relationship("Chunk", back_populates="file_mappings")
 
     __table_args__ = (
         UniqueConstraint('file_id', 'chunk_index', name='uq_file_chunk_index'),
@@ -117,23 +150,28 @@ class FileChunk(Base):
 
 
 # ================================================================
-#  ChunkLocation — tracks which nodes store which chunks
+#  ChunkLocation — tracks which nodes physically store which chunks
 #
-#  chunk_hash references the content-addressed chunk.
-#  node_id = 1 means "this node" (same convention as before).
-#  A chunk is considered replicated if it appears on multiple node_ids.
+#  chunk_hash FKs to Chunk.chunk_hash.
+#  node_id is the node's cryptographic identity string (Ed25519
+#  public key hash), NOT a hardcoded integer. Each node stores its
+#  own node_id at startup and uses it in all location records.
+#  This survives node migrations, backup restores, and cluster merges.
 # ================================================================
 
 class ChunkLocation(Base):
     __tablename__ = 'chunk_locations'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    chunk_hash = Column(String(64), nullable=False)
-    node_id = Column(Integer, nullable=False)  # 1 = self
+    chunk_hash = Column(String(64), ForeignKey('chunks.chunk_hash', ondelete='CASCADE'), nullable=False)
+    node_id = Column(String, nullable=False)  # Cryptographic node ID (not hardcoded 1)
+
+    chunk = relationship("Chunk", back_populates="locations")
 
     __table_args__ = (
         UniqueConstraint('chunk_hash', 'node_id', name='uq_chunk_node'),
         Index('ix_chunk_locations_hash', 'chunk_hash'),
+        Index('ix_chunk_locations_node', 'node_id'),
     )
 
 
@@ -159,9 +197,3 @@ class AuditLog(Base):
     action = Column(String, nullable=False)
     details = Column(String, nullable=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-
-
-# Legacy aliases — only used for clean import compatibility
-# New code should use FileChunk and ChunkLocation directly
-Chunk = FileChunk
-Replica = ChunkLocation
