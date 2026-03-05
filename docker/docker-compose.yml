@@ -1,0 +1,91 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# TossIt 3-node development cluster
+#
+# All nodes are EPHEMERAL by default — no named volumes, no bind mounts.
+# Storage dies when you `docker compose down`. Use `docker compose down -v`
+# if you added volumes and want to wipe them explicitly.
+#
+# To persist a node's data, replace its tmpfs with a named volume:
+#   node1:
+#     volumes:
+#       - node1_data:/data
+# and add it to the top-level `volumes:` section.
+#
+# Access from host:
+#   node1 → http://localhost:8001
+#   node2 → http://localhost:8002
+#   node3 → http://localhost:8003
+# ---------------------------------------------------------------------------
+
+x-node-base: &node-base
+  context: ..
+  build: docker/Dockerfile
+  environment:
+    TOSSIT_CLUSTER_ID: "deadbeef"          # same for all nodes in a cluster
+    TOSSIT_STORAGE_LIMIT_GB: "1"           # keep small for dev
+    TOSSIT_DATA_DIR: "/data"
+  restart: "no"                            # don't auto-restart during tests
+  networks:
+    - tossit
+
+services:
+  node1:
+    <<: *node-base
+    hostname: node1
+    container_name: tossit_node1
+    environment:
+      TOSSIT_CLUSTER_ID: "deadbeef"
+      TOSSIT_NODE_NAME: "node1"
+      TOSSIT_STORAGE_LIMIT_GB: "1"
+      TOSSIT_DATA_DIR: "/data"
+      TOSSIT_FIRST_NODE: "true"
+      TOSSIT_PEER_URLS: "http://node2:8000,http://node3:8000"
+    volumes:
+      - node1_data:/data
+    ports:
+      - "8001:8000"
+
+  node2:
+    <<: *node-base
+    hostname: node2
+    container_name: tossit_node2
+    environment:
+      TOSSIT_CLUSTER_ID: "deadbeef"
+      TOSSIT_NODE_NAME: "node2"
+      TOSSIT_STORAGE_LIMIT_GB: "1"
+      TOSSIT_DATA_DIR: "/data"
+      TOSSIT_FIRST_NODE: "false"
+      TOSSIT_PEER_URLS: "http://node1:8000,http://node3:8000"
+    volumes:
+      - node2_data:/data
+    ports:
+      - "8002:8000"
+
+  node3:
+    <<: *node-base
+    hostname: node3
+    container_name: tossit_node3
+    environment:
+      TOSSIT_CLUSTER_ID: "deadbeef"
+      TOSSIT_NODE_NAME: "node3"
+      TOSSIT_STORAGE_LIMIT_GB: "1"
+      TOSSIT_DATA_DIR: "/data"
+      TOSSIT_FIRST_NODE: "false"
+      TOSSIT_PEER_URLS: "http://node1:8000,http://node2:8000"
+    volumes:
+      - node3_data:/data
+    ports:
+      - "8003:8000"
+
+networks:
+  tossit:
+    driver: bridge
+
+# Named volumes — live on disk under /var/lib/docker/volumes/
+# Wiped completely with `docker compose down -v` or `./cluster.sh down`
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
