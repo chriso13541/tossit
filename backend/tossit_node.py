@@ -45,6 +45,31 @@ import uvicorn
 # Maximum upload size (10 GB)
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024 * 1024
 
+# ---------------------------------------------------------------------------
+# DATA ROOT — single source of truth for all persistent state.
+#
+# In bare-metal / dev:   defaults to ~/.tossit  (same as before)
+# In Docker:             set TOSSIT_DATA_DIR=/data  (mapped volume)
+#
+# Everything under DATA_ROOT:
+#   database/   — SQLite db + Raft state
+#   storage/    — chunks, staging, upload_temp
+#   keys/       — per-node Ed25519 keypairs
+#   trust_store.json  — TOFU peer trust records
+#   node_config.yaml  — persisted node/cluster config
+# ---------------------------------------------------------------------------
+DATA_ROOT       = Path(os.environ.get('TOSSIT_DATA_DIR', Path.home() / '.tossit')).resolve()
+CONFIG_DIR      = DATA_ROOT
+CONFIG_FILE     = DATA_ROOT / "node_config.yaml"
+STORAGE_DIR     = DATA_ROOT / "storage"
+DB_DIR          = DATA_ROOT / "database"
+KEYS_DIR        = DATA_ROOT / "keys"
+TRUST_STORE_FILE = DATA_ROOT / "trust_store.json"
+
+# Ensure base directories exist on import so every subsystem can rely on them.
+for _d in (DATA_ROOT, STORAGE_DIR, DB_DIR, KEYS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
 
 async def db_commit_with_retry(db, max_retries=5, base_delay=0.05):
     """
@@ -89,48 +114,6 @@ from models import (
     Base, Node, File as FileModel, Chunk, FileChunk, ChunkLocation, Job, AuditLog,
     NodeStatus, JobStatus, JobType
 )
-
-
-# Configuration paths
-CONFIG_DIR = Path.home() / ".tossit"
-CONFIG_FILE = CONFIG_DIR / "node_config.yaml"
-STORAGE_DIR = CONFIG_DIR / "storage"
-DB_DIR = CONFIG_DIR / "database"
-
-# Ensure directories exist
-CONFIG_DIR.mkdir(exist_ok=True)
-STORAGE_DIR.mkdir(exist_ok=True)
-DB_DIR.mkdir(exist_ok=True)
-
-
-def get_disk_usage(path: Path) -> tuple[float, float, float]:
-    """Get disk usage for path in GB (for setup only)"""
-    stat = shutil.disk_usage(path)
-    total_gb = stat.total / (1024 ** 3)
-    used_gb = stat.used / (1024 ** 3)
-    free_gb = stat.free / (1024 ** 3)
-    return total_gb, used_gb, free_gb
-
-
-def get_storage_usage(storage_path: Path) -> float:
-    """
-    Calculate actual storage used by TossIt chunk data.
-    Scans the content-addressed chunks/ directory.
-    Returns: used_gb
-    """
-    total_bytes = 0
-
-    if storage_path.exists():
-        chunks_dir = storage_path / "chunks"
-        if chunks_dir.exists():
-            for chunk_file in chunks_dir.glob("*.dat"):
-                try:
-                    total_bytes += chunk_file.stat().st_size
-                except Exception:
-                    pass
-
-    used_gb = total_bytes / (1024 ** 3)
-    return used_gb
 
 
 class NodeConfig:
@@ -209,9 +192,81 @@ class NodeConfig:
             print(f"Error loading config: {e}")
             return config
 
+    @staticmethod
+    def from_env() -> Optional['NodeConfig']:
+        """
+        Build NodeConfig purely from environment variables.
+
+        Required env vars:
+            TOSSIT_NODE_NAME   — human-readable name for this node
+            TOSSIT_CLUSTER_ID  — 8-char hex cluster identifier
+
+        Optional env vars:
+            TOSSIT_PORT              (default 8000)
+            TOSSIT_STORAGE_LIMIT_GB  (default 50)
+            TOSSIT_FIRST_NODE        (1 / true / yes  →  True)
+
+        Returns None when the required vars are absent so callers can fall
+        through to the YAML config or the interactive setup wizard.
+        """
+        node_name  = os.environ.get('TOSSIT_NODE_NAME', '').strip()
+        cluster_id = os.environ.get('TOSSIT_CLUSTER_ID', '').strip()
+
+        if not node_name or not cluster_id:
+            return None
+
+        config = NodeConfig()
+        config.node_name        = node_name
+        config.cluster_id       = cluster_id
+        config.node_id          = NodeConfig.generate_node_id()   # placeholder; overwritten by crypto ID
+        config.port             = int(os.environ.get('TOSSIT_PORT', '8000'))
+        config.storage_limit_gb = float(os.environ.get('TOSSIT_STORAGE_LIMIT_GB', '50'))
+        config.is_first_node    = os.environ.get('TOSSIT_FIRST_NODE', '').lower() in ('1', 'true', 'yes')
+        config.cluster_mode     = 'private'
+        config.center_enabled   = False
+
+        print(f"Configuration loaded from environment variables")
+        print(f"  NODE_NAME  = {config.node_name}")
+        print(f"  CLUSTER_ID = {config.cluster_id}")
+        print(f"  PORT       = {config.port}")
+        print(f"  STORAGE    = {config.storage_limit_gb} GB")
+        print(f"  FIRST_NODE = {config.is_first_node}")
+
+        return config
+
     def exists(self) -> bool:
         """Check if configuration exists"""
         return CONFIG_FILE.exists() and self.node_id is not None
+
+
+def get_disk_usage(path: Path) -> tuple[float, float, float]:
+    """Get disk usage for path in GB (for setup only)"""
+    stat = shutil.disk_usage(path)
+    total_gb = stat.total / (1024 ** 3)
+    used_gb = stat.used / (1024 ** 3)
+    free_gb = stat.free / (1024 ** 3)
+    return total_gb, used_gb, free_gb
+
+
+def get_storage_usage(storage_path: Path) -> float:
+    """
+    Calculate actual storage used by TossIt chunk data.
+    Scans the content-addressed chunks/ directory.
+    Returns: used_gb
+    """
+    total_bytes = 0
+
+    if storage_path.exists():
+        chunks_dir = storage_path / "chunks"
+        if chunks_dir.exists():
+            for chunk_file in chunks_dir.glob("*.dat"):
+                try:
+                    total_bytes += chunk_file.stat().st_size
+                except Exception:
+                    pass
+
+    used_gb = total_bytes / (1024 ** 3)
+    return used_gb
 
 
 def get_local_ip() -> str:
@@ -355,21 +410,26 @@ class TossItNode:
         print(f"Content-addressed storage: {self.chunks_dir}")
         print(f"Upload staging: {self.staging_dir}")
 
-        # SECURITY: Initialize cryptographic identity
-        keys_path = Path.home() / ".tossit" / "keys" / config.node_name
+        # SECURITY: Initialize cryptographic identity.
+        # Keys live under DATA_ROOT/keys/<node_name>/ — fully portable,
+        # never scattered into the user's home directory.
+        keys_path = KEYS_DIR / config.node_name
         self.identity = NodeIdentity(config.node_name, keys_path)
 
-        # SECURITY: Initialize trust store
-        trust_store_path = Path.home() / ".tossit" / "trust_store.json"
-        self.trust_store = TrustStore(trust_store_path)
+        # SECURITY: Initialize trust store.
+        # Single file at DATA_ROOT/trust_store.json — survives across restarts
+        # and is included in whatever volume/backup covers DATA_ROOT.
+        self.trust_store = TrustStore(TRUST_STORE_FILE)
 
         # Use cryptographic node ID (overrides the config.node_id)
         self.node_id = self.identity.get_node_id()
 
         print(f"Node identity:")
-        print(f"Name:       {config.node_name}")
-        print(f"ID:         {self.node_id}")
-        print(f"Public key: {self.identity.get_public_key_base64()[:32]}...")
+        print(f"  Name:       {config.node_name}")
+        print(f"  ID:         {self.node_id}")
+        print(f"  Public key: {self.identity.get_public_key_base64()[:32]}...")
+        print(f"  Keys path:  {keys_path}")
+        print(f"  Trust store: {TRUST_STORE_FILE}")
 
         # Discovery and Raft setup
         self.discovery: Optional[ClusterDiscovery] = None
@@ -834,6 +894,89 @@ class TossItNode:
             self.reserved_space_gb -= size_gb
             if self.reserved_space_gb < 0:
                 self.reserved_space_gb = 0
+
+    async def _bootstrap_static_peers(self):
+        """
+        Register peers supplied via the TOSSIT_PEER_URLS environment variable.
+
+        This is the Docker / non-mDNS discovery path. mDNS still runs in
+        parallel — whichever discovers a peer first wins, duplicates are
+        safely ignored because both paths call _on_node_discovered which
+        keys on node_id.
+
+        TOSSIT_PEER_URLS accepts a comma-separated list of base URLs:
+            TOSSIT_PEER_URLS=http://node1:8000,http://node2:8000
+
+        Each URL is queried for /api/health to obtain the node_id, name,
+        and capacity.  Unreachable peers are skipped and retried by the
+        normal periodic health check loop.
+        """
+        raw = os.environ.get('TOSSIT_PEER_URLS', '').strip()
+        if not raw:
+            return
+
+        peer_urls = [u.strip().rstrip('/') for u in raw.split(',') if u.strip()]
+        if not peer_urls:
+            return
+
+        print(f"Static peer bootstrap: {len(peer_urls)} URL(s) from TOSSIT_PEER_URLS")
+
+        session = await self._get_http_session()
+
+        for url in peer_urls:
+            # Retry a few times — peers in the same compose cluster may still
+            # be starting up when we first try.
+            for attempt in range(5):
+                try:
+                    async with session.get(
+                        f"{url}/api/health",
+                        timeout=aiohttp.ClientTimeout(total=3.0)
+                    ) as resp:
+                        if resp.status != 200:
+                            raise ValueError(f"HTTP {resp.status}")
+
+                        data = await resp.json()
+
+                        # Validate minimum required fields
+                        peer_node_id = data.get('node_id')
+                        peer_name    = data.get('node_name', 'unknown')
+                        if not peer_node_id:
+                            print(f"Static peer {url}: missing node_id in /api/health response")
+                            break
+
+                        # Skip ourselves
+                        if peer_node_id == self.node_id:
+                            break
+
+                        # Parse host + port from the URL
+                        from urllib.parse import urlparse
+                        parsed   = urlparse(url)
+                        peer_ip  = parsed.hostname or '127.0.0.1'
+                        peer_port = parsed.port or 8000
+
+                        node_info = {
+                            'node_id':       peer_node_id,
+                            'node_name':     peer_name,
+                            'ip_address':    peer_ip,
+                            'port':          peer_port,
+                            'storage_gb':    data.get('total_capacity_gb', 0),
+                            'free_capacity_gb': data.get('free_capacity_gb', 0),
+                            'cluster_id':    data.get('cluster_id', self.config.cluster_id),
+                            'discovered_at': datetime.now(timezone.utc).isoformat(),
+                            'service_name':  f"static-{peer_node_id}",
+                        }
+
+                        await self._on_node_discovered(node_info)
+                        print(f"Static peer registered: {peer_name} @ {peer_ip}:{peer_port}")
+                        break  # success
+
+                except Exception as e:
+                    wait = 2 ** attempt
+                    if attempt < 4:
+                        print(f"Static peer {url} not ready (attempt {attempt+1}/5), retrying in {wait}s: {e}")
+                        await asyncio.sleep(wait)
+                    else:
+                        print(f"Static peer {url} unreachable after 5 attempts: {e}")
 
     async def _replicate_file_chunks(self, file_id: int):
         """
@@ -2586,6 +2729,7 @@ class TossItNode:
         print(f"Node ID:       {self.config.node_id}")
         print(f"Storage:       {self.config.storage_limit_gb:.1f} GB allocated")
         print(f"Port:          {self.config.port}")
+        print(f"Data root:     {DATA_ROOT}")
         print("="*60)
         print()
 
@@ -2621,8 +2765,11 @@ class TossItNode:
             on_node_discovered=self._on_node_discovered,
             on_node_lost=self._on_node_lost
         )
-
         await self.discovery.start()
+
+        # Static peer bootstrap runs after mDNS starts so both discovery
+        # paths are active simultaneously.  Duplicates are harmless.
+        asyncio.create_task(self._bootstrap_static_peers())
 
         registry_url = os.getenv('TOSSIT_REGISTRY_URL')
         if registry_url:
@@ -2731,16 +2878,27 @@ class TossItNode:
 
 
 async def main():
-    """Main entry point"""
-    config = NodeConfig.load()
+    """
+    Main entry point — config priority:
+      1. Environment variables  (TOSSIT_NODE_NAME + TOSSIT_CLUSTER_ID required)
+      2. Persisted YAML config  (~/.tossit/node_config.yaml or $TOSSIT_DATA_DIR/node_config.yaml)
+      3. Interactive setup wizard
+    """
+    # Priority 1: env vars (Docker / CI / scripted deployments)
+    config = NodeConfig.from_env()
 
-    if not config.exists():
-        config = interactive_setup()
-    else:
-        print(f"Using existing configuration")
-        print(f"Node: {config.node_name}")
-        print(f"Cluster: {config.cluster_id}")
-        print(f"Storage: {config.storage_limit_gb:.1f} GB")
+    if config is None:
+        # Priority 2: persisted YAML
+        config = NodeConfig.load()
+
+        if not config.exists():
+            # Priority 3: interactive wizard (dev / first-run on bare metal)
+            config = interactive_setup()
+        else:
+            print(f"Using existing configuration")
+            print(f"Node: {config.node_name}")
+            print(f"Cluster: {config.cluster_id}")
+            print(f"Storage: {config.storage_limit_gb:.1f} GB")
 
     node = TossItNode(config)
     await node.start()
