@@ -20,8 +20,9 @@ version: "3.9"
 # ---------------------------------------------------------------------------
 
 x-node-base: &node-base
-  context: ..
-  build: docker/Dockerfile
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
   environment:
     TOSSIT_CLUSTER_ID: "deadbeef"          # same for all nodes in a cluster
     TOSSIT_STORAGE_LIMIT_GB: "1"           # keep small for dev

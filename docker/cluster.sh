@@ -71,7 +71,9 @@ EOF
 
     cat <<EOF
   ${name}:
-    build: .
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     hostname: ${name}
     container_name: ${PROJECT}_${name}
     environment:
