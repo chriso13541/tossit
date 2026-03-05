@@ -60,7 +60,7 @@ async def db_commit_with_retry(db, max_retries=5, base_delay=0.05):
         except OperationalError as e:
             if "locked" in str(e).lower() and attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
-                print(f"DB locked on commit (attempt {attempt + 1}/{max_retries}), retrying in {delay:.2f}s...")
+                print(f"⚠️  DB locked on commit (attempt {attempt + 1}/{max_retries}), retrying in {delay:.2f}s...")
                 await asyncio.sleep(delay)
                 continue
             raise
@@ -80,7 +80,7 @@ async def db_flush_with_retry(db, max_retries=5, base_delay=0.05):
         except OperationalError as e:
             if "locked" in str(e).lower() and attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
-                print(f"DB locked on flush (attempt {attempt + 1}/{max_retries}), retrying in {delay:.2f}s...")
+                print(f"⚠️  DB locked on flush (attempt {attempt + 1}/{max_retries}), retrying in {delay:.2f}s...")
                 await asyncio.sleep(delay)
                 continue
             raise
@@ -216,7 +216,7 @@ class NodeConfig:
             return config
             
         except Exception as e:
-            print(f"Error loading config: {e}")
+            print(f"⚠️  Error loading config: {e}")
             return config
     
     def exists(self) -> bool:
@@ -239,7 +239,7 @@ def get_local_ip() -> str:
 def interactive_setup() -> NodeConfig:
     """Interactive first-time setup"""
     print("\n" + "="*60)
-    print("TossIt v2.0 - First Time Setup")
+    print("  TossIt v2.0 - First Time Setup")
     print("="*60)
     print()
     
@@ -271,10 +271,10 @@ def interactive_setup() -> NodeConfig:
         try:
             requested = float(storage_input)
             if requested <= 0:
-                print("Storage must be greater than 0")
+                print("⚠️  Storage must be greater than 0")
                 continue
             if requested > free_gb:
-                print(f"Only {free_gb:.1f} GB available")
+                print(f"⚠️  Only {free_gb:.1f} GB available")
                 use_max = input(f"Use maximum available ({free_gb * 0.9:.1f} GB)? [y/n]: ").strip().lower()
                 if use_max == 'y':
                     config.storage_limit_gb = free_gb * 0.9
@@ -285,7 +285,7 @@ def interactive_setup() -> NodeConfig:
                 config.storage_limit_gb = requested
                 break
         except ValueError:
-            print("Please enter a valid number")
+            print("⚠️  Please enter a valid number")
             continue
     
     print(f"✓ Allocated: {config.storage_limit_gb:.1f} GB")
@@ -301,16 +301,16 @@ def interactive_setup() -> NodeConfig:
         config.is_first_node = True
         config.cluster_id = NodeConfig.generate_cluster_id()
         print(f"\n✓ Created new cluster: {config.cluster_id}")
-        print(f"\n  IMPORTANT: Share this cluster ID with others to join:")
-        print(f" {config.cluster_id}")
+        print(f"\n📋 IMPORTANT: Share this cluster ID with others to join:")
+        print(f"   {config.cluster_id}")
         print()
     elif choice == "2":
         config.is_first_node = False
         cluster_id = input("\nEnter cluster ID (8 characters): ").strip()
         
         if len(cluster_id) != 8:
-            print("Invalid cluster ID (must be 8 characters)")
-            print("Starting as single-node cluster instead...")
+            print("⚠️  Invalid cluster ID (must be 8 characters)")
+            print("   Starting as single-node cluster instead...")
             config.cluster_id = NodeConfig.generate_cluster_id()
             config.is_first_node = True
         else:
@@ -379,10 +379,10 @@ class TossItNode:
         # Use cryptographic node ID (overrides the config.node_id)
         self.node_id = self.identity.get_node_id()
         
-        print(f" Node identity:")
-        print(f" Name:       {config.node_name}")
-        print(f" ID:         {self.node_id}")
-        print(f" Public key: {self.identity.get_public_key_base64()[:32]}...")
+        print(f"🔐 Node identity:")
+        print(f"   Name:       {config.node_name}")
+        print(f"   ID:         {self.node_id}")
+        print(f"   Public key: {self.identity.get_public_key_base64()[:32]}...")
 
         # Discovery and Raft setup
         self.discovery: Optional[ClusterDiscovery] = None
@@ -477,7 +477,7 @@ class TossItNode:
         node_id = node_info['node_id']
         self.peer_nodes[node_id] = node_info
         
-        print(f"Peer joined: {node_info['node_name']} ({node_info['ip_address']})")
+        print(f"✨ Peer joined: {node_info['node_name']} ({node_info['ip_address']})")
         
         # Update Raft with new peer list
         if self.raft:
@@ -493,14 +493,14 @@ class TossItNode:
             # Give the new node a moment to fully initialize
             await asyncio.sleep(2)
             
-            print(f"Leader initiating redistribution for new node...")
+            print(f"👑 Leader initiating redistribution for new node...")
             await self._redistribute_existing_files()
     
     async def _on_node_lost(self, node_id: str):
         """Called when a node leaves"""
         if node_id in self.peer_nodes:
             node_info = self.peer_nodes[node_id]
-            print(f"Peer left cluster: {node_info['node_name']}")
+            print(f"👋 Peer left cluster: {node_info['node_name']}")
             del self.peer_nodes[node_id]
             
             # Update Raft with new peer list
@@ -526,14 +526,14 @@ class TossItNode:
         
         if node_id in self.peer_nodes:
             node_info = self.peer_nodes[node_id]
-            print(f" Node went offline: {node_info['node_name']} (health monitor timeout, confirmed by heartbeat thread)")
-            print(f" Raft peers unchanged — Raft handles leader detection independently")
+            print(f"💔 Node went offline: {node_info['node_name']} (health monitor timeout, confirmed by heartbeat thread)")
+            print(f"   ℹ️  Raft peers unchanged — Raft handles leader detection independently")
             
             # Note: Keep in peer_nodes for now so UI can show offline status
     
     async def _periodic_peer_refresh(self):
         """Periodically check peer health, measure latency, and update capacity info"""
-        print("Periodic peer health check started (every 5s)")
+        print("💓 Periodic peer health check started (every 5s)")
         
         while True:
             try:
@@ -599,18 +599,18 @@ class TossItNode:
                             pass
             
             except asyncio.CancelledError:
-                print("Periodic peer health check stopped")
+                print("💓 Periodic peer health check stopped")
                 break
             except Exception as e:
-                print(f"Peer health check error: {e}")
+                print(f"⚠️  Peer health check error: {e}")
     
     # Raft callbacks
     async def _on_became_leader(self):
         """Called when this node becomes leader"""
         self.is_leader = True
-        print("This node is now the cluster LEADER")
-        print(f" → Web UI available at: http://{self.local_ip}:{self.config.port}")
-        print(f" → Uploads accepted here")
+        print("🎯 This node is now the cluster LEADER")
+        print(f"   → Web UI available at: http://{self.local_ip}:{self.config.port}")
+        print(f"   → Uploads accepted here")
         
         # Start registry heartbeat if configured
         if self.registry_client:
@@ -622,7 +622,7 @@ class TossItNode:
                 local_ip=self.local_ip
             )
             self.registry_client.start_heartbeat()
-            print(f" Started registry heartbeat for cluster {self.config.cluster_id}")
+            print(f"📡 Started registry heartbeat for cluster {self.config.cluster_id}")
         
         # Run metadata reconciliation in background (doesn't block uploads)
         asyncio.create_task(self._reconcile_on_promotion())
@@ -631,13 +631,13 @@ class TossItNode:
         """Called when this node loses leadership"""
         self.is_leader = False
         self._leadership_lost_at = time.time()  # Track for grace period
-        print("This node is no longer the leader")
-        print("→ Uploads should go to the leader node")
+        print("⚠️  This node is no longer the leader")
+        print("   → Uploads should go to the leader node")
         
         # Stop registry heartbeat if configured
         if self.registry_client:
             self.registry_client.stop_heartbeat()
-            print("Stopped registry heartbeat")
+            print("📡 Stopped registry heartbeat")
     
     def _cleanup_temp_files(self):
         """Remove leftover staging directories and temp files from interrupted uploads"""
@@ -653,7 +653,7 @@ class TossItNode:
                         _shutil.rmtree(d)
                     except Exception:
                         pass
-                print(f" Cleaned up {len(staging_dirs)} staging directories")
+                print(f"🧹 Cleaned up {len(staging_dirs)} staging directories")
         
         # Clean legacy temp files
         pattern = str(self.config.storage_path / "tmp_*_chunk_*.dat")
@@ -664,7 +664,7 @@ class TossItNode:
                     Path(f).unlink()
                 except Exception:
                     pass
-            print(f" Cleaned up {len(temp_files)} legacy temp files")
+            print(f"🧹 Cleaned up {len(temp_files)} legacy temp files")
     
     def _ensure_node_record(self):
         """Ensure this node exists in the database"""
@@ -683,9 +683,7 @@ class TossItNode:
                     cpu_score=1.0,
                     network_speed_mbps=100.0,
                     avg_uptime_percent=100.0,
-                    priority_score=1.0,
                     status=NodeStatus.ONLINE,
-                    is_brain=self.is_leader,
                     last_heartbeat=datetime.now(timezone.utc)
                 )
                 db.add(node)
@@ -788,7 +786,7 @@ class TossItNode:
         if not self.chunks_dir.exists():
             return
         
-        print("Verifying chunk integrity on boot...")
+        print("🔍 Verifying chunk integrity on boot...")
         
         verified = 0
         corrupt = 0
@@ -807,7 +805,7 @@ class TossItNode:
                 
                 if actual_hash != expected_hash:
                     corrupt += 1
-                    print(f"Corrupt chunk: {expected_hash[:12]}... (actual: {actual_hash[:12]}...)")
+                    print(f"   ❌ Corrupt chunk: {expected_hash[:12]}... (actual: {actual_hash[:12]}...)")
                     dat_file.unlink()
                     
                     # Remove DB records for this corrupt chunk
@@ -825,7 +823,7 @@ class TossItNode:
                     verified += 1
             except Exception as e:
                 corrupt += 1
-                print(f"Unreadable chunk: {expected_hash[:12]}... ({e})")
+                print(f"   ❌ Unreadable chunk: {expected_hash[:12]}... ({e})")
                 try:
                     dat_file.unlink()
                 except Exception:
@@ -850,7 +848,7 @@ class TossItNode:
             db.close()
         
         if corrupt > 0 or missing_from_disk > 0:
-            print(f" Integrity check: {verified} OK, {corrupt} corrupt (removed), {missing_from_disk} missing from disk (cleaned)")
+            print(f"🔍 Integrity check: {verified} OK, {corrupt} corrupt (removed), {missing_from_disk} missing from disk (cleaned)")
         else:
             print(f"✓  Integrity check: {verified} chunks verified OK")
     
@@ -908,7 +906,7 @@ class TossItNode:
         })
         chunk_paths.append(chunk_path)
         
-        print(f" ✓ Chunk {chunk_index}: {chunk_size:,} bytes → {chunk_checksum[:12]}...")
+        print(f"   ✓ Chunk {chunk_index}: {chunk_size:,} bytes → {chunk_checksum[:12]}...")
         
         # Yield to event loop
         await asyncio.sleep(0)
@@ -987,7 +985,7 @@ class TossItNode:
             import base64
             
             if not self.peer_nodes:
-                print("No peers available for replication")
+                print("⚠️  No peers available for replication")
                 return
             
             # Calculate replication factor based on cluster size
@@ -997,13 +995,13 @@ class TossItNode:
             else:
                 REPLICATION_FACTOR = min(3, len(self.peer_nodes))  # N=3 for large clusters
             
-            print(f" Starting replication (factor: {REPLICATION_FACTOR}, cluster size: {total_nodes})")
+            print(f"🔄 Starting replication (factor: {REPLICATION_FACTOR}, cluster size: {total_nodes})")
             
             # Select target nodes with house-awareness
             target_nodes = self._select_replica_nodes(REPLICATION_FACTOR)
             
             if not target_nodes:
-                print("No suitable replica nodes found")
+                print("⚠️  No suitable replica nodes found")
                 return
             
             # Get file metadata AND chunk records from a fresh DB session.
@@ -1014,7 +1012,7 @@ class TossItNode:
             try:
                 file_record = db.query(FileModel).filter(FileModel.id == file_id).first()
                 if not file_record:
-                    print(f" File {file_id} not found in database")
+                    print(f"❌ File {file_id} not found in database")
                     return
                 
                 file_metadata = {
@@ -1039,7 +1037,7 @@ class TossItNode:
                 db.close()
             
             if not chunk_records:
-                print(f" No chunks found for file {file_id}")
+                print(f"❌ No chunks found for file {file_id}")
                 return
             
             CHUNK_SIZE = 64 * 1024 * 1024  # 64 MB
@@ -1047,7 +1045,7 @@ class TossItNode:
             # Replicate to each target node
             for target_node_id, target_info in target_nodes:
                 target_url = f"http://{target_info['ip_address']}:{target_info['port']}"
-                print(f"Replicating to: {target_info['node_name']} ({target_info['ip_address']})")
+                print(f"🎯 Replicating to: {target_info['node_name']} ({target_info['ip_address']})")
                 
                 # TCP-LIKE REPLICATION: Track ACKs and retry failed chunks
                 MAX_RETRIES = 3
@@ -1060,7 +1058,7 @@ class TossItNode:
                 }
                 
                 # Initial send: Try to send all chunks (streaming from disk)
-                print(f"Initial send: {len(chunk_records)} chunks to {target_info['node_name']}")
+                print(f"📡 Initial send: {len(chunk_records)} chunks to {target_info['node_name']}")
                 for i, chunk in enumerate(chunk_records):
                     success = await self._send_chunk_from_disk(
                         file_id, chunk, chunk_records,
@@ -1085,7 +1083,7 @@ class TossItNode:
                     
                     # Exponential backoff before retry
                     retry_delay = RETRY_DELAY_BASE ** (retry_round + 1)
-                    print(f"Retry round {retry_round + 1}/{MAX_RETRIES}: {len(failed_chunks)} chunks failed, waiting {retry_delay}s...")
+                    print(f"🔄 Retry round {retry_round + 1}/{MAX_RETRIES}: {len(failed_chunks)} chunks failed, waiting {retry_delay}s...")
                     await asyncio.sleep(retry_delay)
                     
                     # Retry failed chunks
@@ -1105,11 +1103,11 @@ class TossItNode:
                 failed_count = len(chunk_records) - acked_count
                 
                 if failed_count > 0:
-                    print(f"Replication incomplete to {target_info['node_name']}: {acked_count}/{len(chunk_records)} chunks ACKed, {failed_count} failed after {MAX_RETRIES} retries")
+                    print(f"⚠️  Replication incomplete to {target_info['node_name']}: {acked_count}/{len(chunk_records)} chunks ACKed, {failed_count} failed after {MAX_RETRIES} retries")
                 else:
-                    print(f"Replication complete to {target_info['node_name']}: {acked_count}/{len(chunk_records)} chunks ACKed")
+                    print(f"✅ Replication complete to {target_info['node_name']}: {acked_count}/{len(chunk_records)} chunks ACKed")
             
-            print(f"All replications complete: {len(chunk_records)} chunks → {len(target_nodes)} nodes")
+            print(f"✅ All replications complete: {len(chunk_records)} chunks → {len(target_nodes)} nodes")
             
             # Mark file as replicated in database
             db = self.SessionLocal()
@@ -1118,14 +1116,14 @@ class TossItNode:
                 if file_record and not file_record.is_replicated:
                     file_record.is_replicated = True
                     await db_commit_with_retry(db)
-                    print(f"File {file_id} marked as replicated")
+                    print(f"✅ File {file_id} marked as replicated")
             except Exception as e:
-                print(f"Error marking file as replicated: {e}")
+                print(f"⚠️  Error marking file as replicated: {e}")
             finally:
                 db.close()
         
         except Exception as e:
-            print(f"Replication failed: {e}")
+            print(f"❌ Replication failed: {e}")
     
     async def _send_chunk_from_disk(
         self, file_id: int, chunk: dict, chunk_records: list,
@@ -1157,7 +1155,7 @@ class TossItNode:
                 # Read chunk data from content-addressed store
                 chunk_path = self.chunks_dir / f"{checksum}.dat"
                 if not chunk_path.exists():
-                    print(f"✗ Chunk {idx} not found: {checksum[:12]}...")
+                    print(f"  ✗ Chunk {idx} not found: {checksum[:12]}...")
                     return False
                 
                 chunk_data = await asyncio.to_thread(chunk_path.read_bytes)
@@ -1200,21 +1198,21 @@ class TossItNode:
                             # Mark as ACKed
                             chunk_status[idx]['sent'] = True
                             chunk_status[idx]['acked'] = True
-                            print(f"✓ Chunk {idx + 1}/{len(chunk_records)} ACKed → {target_info['node_name']}")
+                            print(f"  ✓ Chunk {idx + 1}/{len(chunk_records)} ACKed → {target_info['node_name']}")
                             return True
                         else:
-                            print(f"✗ Chunk {idx} invalid ACK response")
+                            print(f"  ✗ Chunk {idx} invalid ACK response")
                             return False
                     
                     elif response.status == 401:
-                        print(f"✗ Chunk {idx} rejected: Invalid signature")
+                        print(f"  ✗ Chunk {idx} rejected: Invalid signature")
                         return False
                     else:
-                        print(f"✗ Chunk {idx} failed: HTTP {response.status}")
+                        print(f"  ✗ Chunk {idx} failed: HTTP {response.status}")
                         return False
         
         except Exception as e:
-            print(f"✗ Chunk {idx} error: {e}")
+            print(f"  ✗ Chunk {idx} error: {e}")
             return False
     
     def _select_replica_nodes(self, N: int) -> list:
@@ -1267,7 +1265,7 @@ class TossItNode:
         selected = sorted_peers[:N]
         
         if len(selected) < N:
-            print(f"Only {len(selected)} replica nodes available (wanted {N})")
+            print(f"⚠️  Only {len(selected)} replica nodes available (wanted {N})")
         
         # Log selection details
         self._log_replica_selection(selected)
@@ -1279,7 +1277,7 @@ class TossItNode:
         if not selected_replicas:
             return
         
-        print(f"Selected {len(selected_replicas)} replica nodes:")
+        print(f"📍 Selected {len(selected_replicas)} replica nodes:")
         
         # Collect latencies and categorize nodes
         latencies = []
@@ -1294,7 +1292,7 @@ class TossItNode:
             latency = node_info.get('latency_ms', 0)
             utilization = ((total_gb - free_gb) / total_gb * 100) if total_gb > 0 else 0
             
-            print(f" • {node_info['node_name']}: {free_gb:.1f}GB free / {total_gb:.1f}GB total ({utilization:.1f}% used), {latency:.1f}ms latency")
+            print(f"   • {node_info['node_name']}: {free_gb:.1f}GB free / {total_gb:.1f}GB total ({utilization:.1f}% used), {latency:.1f}ms latency")
             
             # Categorize by latency
             if latency > 50:
@@ -1323,20 +1321,20 @@ class TossItNode:
         diversity_str = ", ".join(diversity_parts)
         
         if far_count > 0:
-            print(f"Geographic diversity: {diversity_str}")
+            print(f"✨ Geographic diversity: {diversity_str}")
         elif medium_count > 0:
-            print(f"Regional diversity: {diversity_str}")
+            print(f"🌍 Regional diversity: {diversity_str}")
         elif close_count > 0:
-            print(f"Local replicas only: {diversity_str} - consider adding remote nodes")
+            print(f"⚠️  Local replicas only: {diversity_str} - consider adding remote nodes")
         else:
-            print(f"Replica distribution: {diversity_str}")
+            print(f"📊 Replica distribution: {diversity_str}")
         
         # Show actual latencies for transparency
         if latencies:
             min_lat = min(latencies)
             max_lat = max(latencies)
             avg_lat = sum(latencies) / len(latencies)
-            print(f" Latency range: {min_lat:.1f}ms - {max_lat:.1f}ms (avg: {avg_lat:.1f}ms)")
+            print(f"   Latency range: {min_lat:.1f}ms - {max_lat:.1f}ms (avg: {avg_lat:.1f}ms)")
     
     async def _decrement_assignment(self, node_id: str = "self"):
         """Decrement the assignment counter when an upload completes."""
@@ -1394,14 +1392,14 @@ class TossItNode:
         """
         print()
         print("=" * 60)
-        print("METADATA RECONCILIATION — new leader recovery")
+        print("  🔄 METADATA RECONCILIATION — new leader recovery")
         print("=" * 60)
         
         # Allow cluster to stabilize (peers need to recognize new leader)
         await asyncio.sleep(3.0)
         
         if not self.raft or not self.raft.is_leader():
-            print("Lost leadership during reconciliation wait — aborting")
+            print("ℹ️  Lost leadership during reconciliation wait — aborting")
             return
         
         # ========================================
@@ -1419,12 +1417,12 @@ class TossItNode:
                     for f in stale:
                         db.delete(f)
                     await db_commit_with_retry(db)
-                    print(f"Step 1: Cleaned {len(stale)} stale delegation placeholders (IDs: {stale_ids})")
+                    print(f"🧹 Step 1: Cleaned {len(stale)} stale delegation placeholders (IDs: {stale_ids})")
                 else:
-                    print(f"Step 1: No stale delegation placeholders")
+                    print(f"✓  Step 1: No stale delegation placeholders")
             except Exception as e:
                 db.rollback()
-                print(f"Step 1 failed: {e}")
+                print(f"⚠️  Step 1 failed: {e}")
             finally:
                 db.close()
         
@@ -1449,7 +1447,7 @@ class TossItNode:
                 db.close()
         
         if orphaned_hashes:
-            print(f"Step 2: Found {len(orphaned_hashes)} orphaned chunks on local disk (unreferenced by any file)")
+            print(f"🔍 Step 2: Found {len(orphaned_hashes)} orphaned chunks on local disk (unreferenced by any file)")
         else:
             print(f"✓  Step 2: No orphaned chunks on local disk")
         
@@ -1476,14 +1474,14 @@ class TossItNode:
                         inv = await resp.json()
                         peer_inventories[node_id] = inv
                         file_count = len(inv.get("files", []))
-                        print(f"Step 3: {peer_info['node_name']} reports {file_count} files")
+                        print(f"📋 Step 3: {peer_info['node_name']} reports {file_count} files")
                     else:
-                        print(f"Step 3: {peer_info['node_name']} returned HTTP {resp.status}")
+                        print(f"⚠️  Step 3: {peer_info['node_name']} returned HTTP {resp.status}")
             except Exception as e:
-                print(f"Step 3: Failed to reach {peer_info['node_name']}: {e}")
+                print(f"⚠️  Step 3: Failed to reach {peer_info['node_name']}: {e}")
         
         if not peer_inventories:
-            print("Step 3: No peer inventories available — reconciliation limited to local data")
+            print("ℹ️  Step 3: No peer inventories available — reconciliation limited to local data")
         
         # ========================================
         # STEP 4: Import metadata for unknown files
@@ -1572,10 +1570,10 @@ class TossItNode:
                             await db_commit_with_retry(db2)
                             files_imported += 1
                             chunk_count = len(file_info.get("chunks_on_disk", []))
-                            print(f"Imported: {file_info['filename']} (ID: {file_id}, {chunk_count} chunks) from {peer_name}")
+                            print(f"   📥 Imported: {file_info['filename']} (ID: {file_id}, {chunk_count} chunks) from {peer_name}")
                         except Exception as e:
                             db2.rollback()
-                            print(f"Failed to import file {file_id}: {e}")
+                            print(f"   ⚠️  Failed to import file {file_id}: {e}")
                         finally:
                             db2.close()
                 finally:
@@ -1622,14 +1620,14 @@ class TossItNode:
                 db.close()
             
             if replication_needed > 0:
-                print(f"Step 5: Triggered replication for {replication_needed} under-replicated files")
+                print(f"🔄 Step 5: Triggered replication for {replication_needed} under-replicated files")
             else:
-                print(f"Step 5: All files properly replicated")
+                print(f"✓  Step 5: All files properly replicated")
         else:
-            print(f"Step 5: No peers — skipping replication check")
+            print(f"ℹ️  Step 5: No peers — skipping replication check")
         
         print("=" * 60)
-        print("RECONCILIATION COMPLETE")
+        print("  ✅ RECONCILIATION COMPLETE")
         print("=" * 60)
         print()
     
@@ -1641,11 +1639,11 @@ class TossItNode:
         get replicated once a second node joins.
         """
         if not self.raft or not self.raft.is_leader():
-            print("Not leader, skipping redistribution")
+            print("ℹ️  Not leader, skipping redistribution")
             return
         
         if len(self.peer_nodes) == 0:
-            print("No peers available for redistribution")
+            print("ℹ️  No peers available for redistribution")
             return
         
         db = self.SessionLocal()
@@ -1690,16 +1688,16 @@ class TossItNode:
                     # File is properly replicated, skip
                     pass
                 elif already_replicated and needs_replication:
-                    print(f"File {filename} marked as replicated but only has {current_replicas}/{target_replication} replicas (likely node went offline)")
+                    print(f"ℹ️  File {filename} marked as replicated but only has {current_replicas}/{target_replication} replicas (likely node went offline)")
             
             if not files_to_replicate:
                 print("✓ All files properly replicated")
                 return
             
-            print(f"Redistributing {len(files_to_replicate)} files to new cluster topology...")
+            print(f"🔄 Redistributing {len(files_to_replicate)} files to new cluster topology...")
             
             for file_id, filename, current_replicas, total_chunks in files_to_replicate:
-                print(f"Replicating: {filename} (currently {current_replicas} replicas, want {target_replication})")
+                print(f"📦 Replicating: {filename} (currently {current_replicas} replicas, want {target_replication})")
                 
                 # Get chunk records (content-addressed)
                 chunks = db.query(FileChunk).filter(
@@ -1707,21 +1705,21 @@ class TossItNode:
                 ).order_by(FileChunk.chunk_index).all()
                 
                 if not chunks:
-                    print(f"No chunks found for file {file_id}")
+                    print(f"   ⚠️  No chunks found for file {file_id}")
                     continue
                 
                 try:
                     # Trigger replication (reads chunks from disk, no memory loading)
                     await self._replicate_file_chunks(file_id)
                     
-                    print(f"Replication scheduled for {filename}")
+                    print(f"   ✓ Replication scheduled for {filename}")
                 except Exception as e:
-                    print(f"Failed to replicate {filename}: {e}")
+                    print(f"   ❌ Failed to replicate {filename}: {e}")
             
-            print(f"Redistribution complete")
+            print(f"✅ Redistribution complete")
             
         except Exception as e:
-            print(f"Redistribution failed: {e}")
+            print(f"❌ Redistribution failed: {e}")
         finally:
             db.close()
     
@@ -1730,7 +1728,7 @@ class TossItNode:
         leader_info = self.peer_nodes[leader_id]
         leader_url = f"http://{leader_info['ip_address']}:{leader_info['port']}/api/upload"
         
-        print(f"Proxying upload to leader {leader_info['node_name']}...")
+        print(f"🔄 Proxying upload to leader {leader_info['node_name']}...")
         
         # Read file content
         file_content = await file.read()
@@ -1754,7 +1752,7 @@ class TossItNode:
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        print(f" ✓ Upload proxied successfully")
+                        print(f"   ✓ Upload proxied successfully")
                         return result
                     else:
                         error_text = await response.text()
@@ -1854,7 +1852,7 @@ class TossItNode:
                 verified, message, sender_node_id = self.trust_store.verify_message(request)
                 
                 if not verified:
-                    print(f"Rejected heartbeat: Invalid signature")
+                    print(f"❌ Rejected heartbeat: Invalid signature")
                     raise HTTPException(401, "Invalid signature")
                 
                 # Extract verified data
@@ -1862,7 +1860,7 @@ class TossItNode:
                 term = message['term']
                 leader_name = message.get('node_name', 'unknown')
                 
-                print(f"Verified heartbeat from {leader_name} ({sender_node_id[:8]}...)")
+                print(f"✅ Verified heartbeat from {leader_name} ({sender_node_id[:8]}...)")
             else:
                 # Old insecure format (temporary backward compatibility)
                 leader_id = request.get('leader_id')
@@ -1871,7 +1869,7 @@ class TossItNode:
                 if not leader_id or term is None:
                     raise HTTPException(400, "Missing leader_id or term")
                 
-                print(f"Accepting UNSIGNED heartbeat from {leader_id} (legacy mode)")
+                print(f"⚠️  Accepting UNSIGNED heartbeat from {leader_id} (legacy mode)")
             
             await self.raft.receive_heartbeat(leader_id, term)
             return {"status": "ok", "follower_term": self.raft.current_term}
@@ -1888,7 +1886,7 @@ class TossItNode:
                 verified, message, sender_node_id = self.trust_store.verify_message(request)
                 
                 if not verified:
-                    print(f"Rejected vote request: Invalid signature")
+                    print(f"❌ Rejected vote request: Invalid signature")
                     raise HTTPException(401, "Invalid signature")
                 
                 # Extract verified data
@@ -1896,7 +1894,7 @@ class TossItNode:
                 term = message['term']
                 candidate_name = message.get('node_name', 'unknown')
                 
-                print(f"Verified vote request from {candidate_name} ({sender_node_id[:8]}...)")
+                print(f"✅ Verified vote request from {candidate_name} ({sender_node_id[:8]}...)")
             else:
                 # Old insecure format (temporary backward compatibility)
                 candidate_id = request.get('candidate_id')
@@ -1905,7 +1903,7 @@ class TossItNode:
                 if not candidate_id or term is None:
                     raise HTTPException(400, "Missing candidate_id or term")
                 
-                print(f"Accepting UNSIGNED vote request from {candidate_id} (legacy mode)")
+                print(f"⚠️  Accepting UNSIGNED vote request from {candidate_id} (legacy mode)")
             
             vote_granted = await self.raft.request_vote(candidate_id, term)
             return {"vote_granted": vote_granted}
@@ -2002,7 +2000,7 @@ class TossItNode:
             # If assigning to self, no delegation needed
             if winner["id"] == "self":
                 total_cluster = sum(self._assigned_uploads.values())
-                print(f"Assign '{filename}' → {winner['name']} (self, {winner['active']+1} active, cluster total: {total_cluster})")
+                print(f"📥 Assign '{filename}' → {winner['name']} (self, {winner['active']+1} active, cluster total: {total_cluster})")
                 return {
                     "upload_to": my_url,
                     "delegated": False,
@@ -2036,7 +2034,7 @@ class TossItNode:
                     db.close()
             
             total_cluster = sum(self._assigned_uploads.values())
-            print(f"Assign '{filename}' → {winner['name']} (file_id={file_id}, {winner['active']+1} active, cluster total: {total_cluster})")
+            print(f"📤 Assign '{filename}' → {winner['name']} (file_id={file_id}, {winner['active']+1} active, cluster total: {total_cluster})")
             
             return {
                 "upload_to": winner["url"],
@@ -2079,7 +2077,7 @@ class TossItNode:
             is_delegated = delegated_file_id is not None
             
             if is_delegated:
-                print(f"Delegated upload received: {file.filename} (file_id={delegated_file_id})")
+                print(f"📥 Delegated upload received: {file.filename} (file_id={delegated_file_id})")
             else:
                 # Check if we're the leader (with grace period for in-flight requests)
                 # During heavy I/O, Raft elections can flip leadership temporarily.
@@ -2101,7 +2099,7 @@ class TossItNode:
                         raise HTTPException(503, "No leader available - cluster electing")
                 
                 if recently_was_leader:
-                    print(f"Accepting upload during leadership grace period ({time.time() - self._leadership_lost_at:.1f}s since step-down)")
+                    print(f"⚠️  Accepting upload during leadership grace period ({time.time() - self._leadership_lost_at:.1f}s since step-down)")
             
             # Constants
             CHUNK_SIZE = 64 * 1024 * 1024  # 64MB chunks
@@ -2135,7 +2133,7 @@ class TossItNode:
             import uuid
             temp_id = uuid.uuid4().hex[:12]
             
-            print(f"Upload accepted: {file.filename} ({file_size:,} bytes)")
+            print(f"📤 Upload accepted: {file.filename} ({file_size:,} bytes)")
             
             chunk_paths_temp = []  # Temp paths on disk
             chunk_meta_list = []   # In-memory metadata for batch DB insert
@@ -2148,7 +2146,7 @@ class TossItNode:
                 # Space is already reserved, so queued uploads won't be rejected
                 # for space when they eventually start streaming.
                 async with self._upload_semaphore:
-                    print(f"Streaming started: {file.filename}")
+                    print(f"   ▶ Streaming started: {file.filename}")
                     
                     chunk_index = 0
                     chunk_buffer = bytearray()
@@ -2173,7 +2171,7 @@ class TossItNode:
                             chunk_buffer.clear()
                             
                             if chunk_index % 10 == 0:
-                                print(f"Progress: {chunk_index} chunks ({total_bytes_read / (1024**3):.2f} GB)")
+                                print(f"   Progress: {chunk_index} chunks ({total_bytes_read / (1024**3):.2f} GB)")
                         
                         if total_bytes_read % (READ_SIZE * 100) == 0:
                             await asyncio.sleep(0)
@@ -2276,9 +2274,9 @@ class TossItNode:
                 
                 await self._commit_reservation(file_size_gb)
                 
-                print(f"Upload complete: {file.filename}")
-                print(f" File ID: {file_id}, Size: {total_bytes_read:,} bytes ({chunk_index} chunks)")
-                print(f" Checksum: {file_checksum[:16]}...")
+                print(f"✅ Upload complete: {file.filename}")
+                print(f"   File ID: {file_id}, Size: {total_bytes_read:,} bytes ({chunk_index} chunks)")
+                print(f"   Checksum: {file_checksum[:16]}...")
                 
                 # Update load balancer counter
                 if is_delegated:
@@ -2314,7 +2312,7 @@ class TossItNode:
                     await self._decrement_assignment("self")
                 raise
             except Exception as e:
-                print(f"Upload failed (streaming): {e}")
+                print(f"❌ Upload failed (streaming): {e}")
                 await self._release_reservation(file_size_gb)
                 stage_dir = self.staging_dir / temp_id
                 if stage_dir.exists():
@@ -2355,7 +2353,7 @@ class TossItNode:
                     raise HTTPException(503, "No leader available - cluster electing")
             
             if recently_was_leader:
-                print(f"Accepting upload during leadership grace period")
+                print(f"⚠️  Accepting upload during leadership grace period")
             
             # Peek at file size first (before reading)
             file.file.seek(0, 2)
@@ -2385,8 +2383,8 @@ class TossItNode:
                 )
             
             # Space reserved! Upload can proceed in parallel with others
-            print(f"Upload started: {file.filename} ({file_size:,} bytes)")
-            print(f"Space reserved: {file_size_gb:.2f}GB (lock held <1ms)")
+            print(f"📤 Upload started: {file.filename} ({file_size:,} bytes)")
+            print(f"   ✅ Space reserved: {file_size_gb:.2f}GB (lock held <1ms)")
             
             db = self.SessionLocal()
             chunk_paths = []
@@ -2402,8 +2400,8 @@ class TossItNode:
                 # Calculate number of chunks needed
                 total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE  # Ceiling division
                 
-                print(f" File will be split into {total_chunks} chunk(s) of {CHUNK_SIZE / (1024**2):.0f}MB each")
-                print(f" Other uploads can proceed in parallel!")
+                print(f"   File will be split into {total_chunks} chunk(s) of {CHUNK_SIZE / (1024**2):.0f}MB each")
+                print(f"   Other uploads can proceed in parallel!")
                 
                 # Read entire file content for overall checksum
                 # Use asyncio.to_thread to prevent blocking the event loop
@@ -2430,7 +2428,7 @@ class TossItNode:
                 db.add(file_record)
                 await db_flush_with_retry(db)  # Get ID without committing
                 
-                print(f" Created file record (ID: {file_record.id})")
+                print(f"   Created file record (ID: {file_record.id})")
                 
                 # Process and store each chunk
                 chunk_records = []
@@ -2495,7 +2493,7 @@ class TossItNode:
                     
                     chunk_records.append(file_chunk)
                     
-                    print(f"Chunk {chunk_index + 1}/{total_chunks}: {chunk_size:,} bytes → {chunk_checksum[:12]}...")
+                    print(f"   ✓ Chunk {chunk_index + 1}/{total_chunks}: {chunk_size:,} bytes → {chunk_checksum[:12]}...")
                 
                 # ALL chunks written successfully to disk!
                 # Now mark file as complete
@@ -2509,13 +2507,13 @@ class TossItNode:
                 # COMMIT SPACE RESERVATION (move from reserved to used)
                 await self._commit_reservation(file_size_gb)
                 
-                print(f"Upload complete: {file.filename} (ID: {file_record.id}, {total_chunks} chunks)")
-                print(f" Transaction committed atomically")
-                print(f" Space reservation committed: {file_size_gb:.2f}GB")
+                print(f"✅ Upload complete: {file.filename} (ID: {file_record.id}, {total_chunks} chunks)")
+                print(f"   Transaction committed atomically")
+                print(f"   Space reservation committed: {file_size_gb:.2f}GB")
                 
                 # REPLICATION: Replicate to peers if available
                 if len(self.peer_nodes) > 0:
-                    print(f"Starting replication of {total_chunks} chunks...")
+                    print(f"🔄 Starting replication of {total_chunks} chunks...")
                     asyncio.create_task(self._replicate_file_chunks(file_record.id))
                 
                 return {
@@ -2542,15 +2540,15 @@ class TossItNode:
                 raise
                 
             except Exception as e:
-                print(f"Upload failed: {e}")
+                print(f"❌ Upload failed: {e}")
                 
                 # ROLLBACK: Undo ALL database changes
                 db.rollback()
-                print(f" Database transaction rolled back")
+                print(f"   Database transaction rolled back")
                 
                 # RELEASE SPACE RESERVATION (refund to pool)
                 await self._release_reservation(file_size_gb)
-                print(f" Space reservation released: {file_size_gb:.2f}GB refunded")
+                print(f"   Space reservation released: {file_size_gb:.2f}GB refunded")
                 
                 # CLEANUP: Delete physical chunk files that were written
                 # Only delete if no Chunk record exists (our insert was rolled back,
@@ -2564,13 +2562,13 @@ class TossItNode:
                             ).first()
                             if not existing:
                                 chunk_path.unlink()
-                                print(f" Cleaned up: {chunk_path.name}")
+                                print(f"   Cleaned up: {chunk_path.name}")
                             else:
-                                print(f" Kept (referenced by other file): {chunk_path.name}")
+                                print(f"   Kept (referenced by other file): {chunk_path.name}")
                     except Exception as cleanup_error:
-                        print(f" Cleanup failed for {chunk_path.name}: {cleanup_error}")
+                        print(f"   ⚠️  Cleanup failed for {chunk_path.name}: {cleanup_error}")
                 
-                print(f" Upload completely rolled back (no partial data)")
+                print(f"   Upload completely rolled back (no partial data)")
                 
                 raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
             finally:
@@ -2596,7 +2594,7 @@ class TossItNode:
             if 'signature' in request and 'public_key' in request:
                 verified, message, sender_node_id = self.trust_store.verify_message(request)
                 if not verified:
-                    print(f"Rejected replication: Invalid signature")
+                    print(f"❌ Rejected replication: Invalid signature")
                     raise HTTPException(401, "Invalid signature")
                 
                 file_id = message['file_id']
@@ -2605,7 +2603,7 @@ class TossItNode:
                 chunk_checksum = message['checksum']
                 file_metadata = message.get('file_metadata')
                 sender_name = message.get('node_name', 'unknown')
-                print(f"Verified replication from {sender_name} ({sender_node_id[:8]}...)")
+                print(f"✅ Verified replication from {sender_name} ({sender_node_id[:8]}...)")
                 
                 # IMPLICIT HEARTBEAT: Receiving data from the leader proves it's alive.
                 # In Raft, AppendEntries (replication) resets the election timer just
@@ -2620,7 +2618,7 @@ class TossItNode:
                 chunk_data_b64 = request['chunk_data']
                 chunk_checksum = request['checksum']
                 file_metadata = request.get('file_metadata')
-                print(f"Accepting UNSIGNED replication (legacy mode)")
+                print(f"⚠️  Accepting UNSIGNED replication (legacy mode)")
             
             import base64
             chunk_data = base64.b64decode(chunk_data_b64)
@@ -2655,7 +2653,7 @@ class TossItNode:
                         existing_file.checksum_sha256 = file_metadata['checksum_sha256']
                         existing_file.uploaded_by = file_metadata.get('uploaded_by', 'delegated')
                         await db_flush_with_retry(db)
-                        print(f"Updated delegation placeholder: {file_metadata['filename']} (ID: {file_id})")
+                        print(f"📋 Updated delegation placeholder: {file_metadata['filename']} (ID: {file_id})")
                     elif not existing_file and file_metadata:
                         file_record = FileModel(
                             id=file_id,
@@ -2669,10 +2667,10 @@ class TossItNode:
                         )
                         db.add(file_record)
                         await db_flush_with_retry(db)
-                        print(f"Created file record: {file_metadata['filename']} (ID: {file_id})")
+                        print(f"📋 Created file record: {file_metadata['filename']} (ID: {file_id})")
                     elif not existing_file and not file_metadata:
                         db.close()
-                        print(f"Chunk {chunk_index} for file {file_id}: no file record yet, requesting retry with metadata")
+                        print(f"⚠️  Chunk {chunk_index} for file {file_id}: no file record yet, requesting retry with metadata")
                         raise HTTPException(409, f"File record {file_id} not found - retry with file_metadata")
                     
                     # Canonical Chunk record (insert-if-not-exists)
@@ -2713,19 +2711,19 @@ class TossItNode:
                         if chunks_received == file_record.total_chunks:
                             file_record.is_complete = True
                             file_record.is_replicated = True
-                            print(f"File complete: {file_record.filename} ({file_record.total_chunks} chunks)")
+                            print(f"✅ File complete: {file_record.filename} ({file_record.total_chunks} chunks)")
                     
                     await db_commit_with_retry(db)
                 except HTTPException:
                     raise
                 except Exception as e:
                     db.rollback()
-                    print(f"Replication failed: {e}")
+                    print(f"❌ Replication failed: {e}")
                     raise HTTPException(500, f"Replication failed: {str(e)}")
                 finally:
                     db.close()
             
-            print(f"Received replica: {chunk_checksum[:12]}... (chunk {chunk_index} of file {file_id}, {len(chunk_data)} bytes)")
+            print(f"✅ Received replica: {chunk_checksum[:12]}... (chunk {chunk_index} of file {file_id}, {len(chunk_data)} bytes)")
             
             return {
                 "status": "ack",
@@ -2760,12 +2758,12 @@ class TossItNode:
                 total_size = file_record.total_size_bytes
                 total_chunks = file_record.total_chunks
                 
-                print(f"Download: {filename} (ID: {file_id}, {total_chunks} chunks)")
+                print(f"📥 Download: {filename} (ID: {file_id}, {total_chunks} chunks)")
                 
                 # Check for legacy complete file (old-style single file uploads)
                 complete_file_path = self.config.storage_path / f"file_{file_id}.dat"
                 if complete_file_path.exists():
-                    print(f" Using legacy complete file: {complete_file_path}")
+                    print(f"   Using legacy complete file: {complete_file_path}")
                     db.close()
                     return FileResponse(
                         path=complete_file_path,
@@ -2840,7 +2838,7 @@ class TossItNode:
                 
                 await db_commit_with_retry(db)
                 
-                print(f"Deleted: {filename} (ID: {file_id}, {len(chunk_hashes)} mappings, {gc_count} chunks garbage collected)")
+                print(f"🗑️  Deleted: {filename} (ID: {file_id}, {len(chunk_hashes)} mappings, {gc_count} chunks garbage collected)")
                 
                 # Clean up replicas on peer nodes (fire-and-forget)
                 if self.peer_nodes:
@@ -2889,14 +2887,14 @@ class TossItNode:
                 else:
                     deleted_count = 0
                 
-                print(f"Deleted remote replicas: file {file_id} ({deleted_count} chunks removed)")
+                print(f"🗑️  Deleted remote replicas: file {file_id} ({deleted_count} chunks removed)")
                 return {"status": "ok", "deleted_chunks": deleted_count}
             
             except HTTPException:
                 raise
             except Exception as e:
                 db.rollback()
-                print(f"Remote delete failed: {e}")
+                print(f"❌ Remote delete failed: {e}")
                 raise HTTPException(500, f"Delete failed: {str(e)}")
             finally:
                 db.close()
@@ -3331,7 +3329,7 @@ class TossItNode:
         if not self.peer_nodes:
             return
         
-        print(f"Cleaning up remote replicas for file {file_id}...")
+        print(f"🗑️  Cleaning up remote replicas for file {file_id}...")
         
         for node_id, peer_info in self.peer_nodes.items():
             try:
@@ -3356,16 +3354,16 @@ class TossItNode:
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as response:
                     if response.status == 200:
-                        print(f"Cleaned replicas on {peer_info['node_name']}")
+                        print(f"   ✓ Cleaned replicas on {peer_info['node_name']}")
                     else:
-                        print(f"Cleanup failed on {peer_info['node_name']}: HTTP {response.status}")
+                        print(f"   ⚠️  Cleanup failed on {peer_info['node_name']}: HTTP {response.status}")
             except Exception as e:
-                print(f"Cleanup failed on {peer_info['node_name']}: {e}")
+                print(f"   ⚠️  Cleanup failed on {peer_info['node_name']}: {e}")
     
     async def start(self):
         """Start the node"""
         print("\n" + "="*60)
-        print(f"Starting TossIt Node: {self.config.node_name}")
+        print(f"  🚀 Starting TossIt Node: {self.config.node_name}")
         print("="*60)
         print(f"Cluster ID:    {self.config.cluster_id}")
         print(f"Node ID:       {self.config.node_id}")
@@ -3423,19 +3421,19 @@ class TossItNode:
                 node_name=self.config.node_name,
                 port=self.config.port
             )
-            print(f"Registry configured: {registry_url}")
+            print(f"📡 Registry configured: {registry_url}")
             
             # Test connection
             registry_ok = await self.registry_client.test_connection()
             if registry_ok:
                 print("✓ Registry service reachable")
             else:
-                print("Warning: Registry service not reachable (will retry)")
+                print("⚠️  Warning: Registry service not reachable (will retry)")
             
             # Start periodic stats update task
             asyncio.create_task(self._update_registry_stats_loop())
         else:
-            print("No registry configured (set TOSSIT_REGISTRY_URL to enable)")
+            print("ℹ️  No registry configured (set TOSSIT_REGISTRY_URL to enable)")
         
         # Start web server
         config = uvicorn.Config(
@@ -3505,7 +3503,7 @@ class TossItNode:
             
             return 0.0
         except Exception as e:
-            print(f"Error calculating used capacity: {e}")
+            print(f"⚠️  Error calculating used capacity: {e}")
             return 0.0
         finally:
             db.close()
@@ -3535,7 +3533,7 @@ class TossItNode:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Error updating registry stats: {e}")
+                print(f"⚠️  Error updating registry stats: {e}")
                 await asyncio.sleep(30)
 
 
@@ -3546,10 +3544,10 @@ async def main():
     if not config.exists():
         config = interactive_setup()
     else:
-        print(f"Using existing configuration")
-        print(f"Node: {config.node_name}")
-        print(f"Cluster: {config.cluster_id}")
-        print(f"Storage: {config.storage_limit_gb:.1f} GB")
+        print(f"✓ Using existing configuration")
+        print(f"  Node: {config.node_name}")
+        print(f"  Cluster: {config.cluster_id}")
+        print(f"  Storage: {config.storage_limit_gb:.1f} GB")
     
     node = TossItNode(config)
     await node.start()
@@ -3559,5 +3557,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n TossIt node stopped")
+        print("\n\n👋 TossIt node stopped")
         sys.exit(0)
