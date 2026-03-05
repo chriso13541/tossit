@@ -1708,12 +1708,11 @@ class TossItNode:
 
             is_current_leader = self.raft and self.raft.is_leader()
             if not is_current_leader:
-                leader_id = self.raft.get_leader_id() if self.raft else None
-                if leader_id and leader_id in self.peer_nodes:
-                    peer = self.peer_nodes[leader_id]
-                    leader_url = f"http://{peer['ip_address']}:{peer['port']}"
-                    return {"upload_to": leader_url, "redirect_to_leader": True, "delegated": False, "file_id": None}
-                raise HTTPException(503, "No leader available - cluster electing")
+                # Always tell the client to upload to the node it already reached.
+                # That node will proxy internally to the leader — we never hand out
+                # internal Docker/LAN IPs to the browser.
+                my_url = f"http://{self.local_ip}:{self.config.port}"
+                return {"upload_to": my_url, "redirect_to_leader": False, "delegated": False, "file_id": None}
 
             size_gb = size / (1024 ** 3)
 
@@ -1845,7 +1844,24 @@ class TossItNode:
                     if leader_id and leader_id in self.peer_nodes:
                         peer = self.peer_nodes[leader_id]
                         leader_url = f"http://{peer['ip_address']}:{peer['port']}/api/upload"
-                        return RedirectResponse(url=leader_url, status_code=307)
+                        # Proxy the upload to the leader rather than redirecting the browser.
+                        # A redirect to an internal IP (172.18.x.x) would be unreachable
+                        # from outside the Docker network.
+                        print(f"Proxying upload to leader at {leader_url}")
+                        file.file.seek(0)
+                        file_bytes = await file.read()
+                        import aiohttp as _aiohttp
+                        async with _aiohttp.ClientSession() as _session:
+                            form = _aiohttp.FormData()
+                            form.add_field('file', file_bytes,
+                                           filename=file.filename,
+                                           content_type=file.content_type or 'application/octet-stream')
+                            async with _session.post(leader_url, data=form,
+                                                     timeout=_aiohttp.ClientTimeout(total=3600)) as _resp:
+                                _body = await _resp.json()
+                                if _resp.status != 200:
+                                    raise HTTPException(_resp.status, detail=_body)
+                                return _body
                     else:
                         raise HTTPException(503, "No leader available - cluster electing")
 
