@@ -2538,7 +2538,25 @@ class TossItNode:
                     "latency_ms": node_info.get('latency_ms', None)
                 })
 
-            return nodes
+            # Deduplicate by node name — mDNS and static peer discovery can
+            # both register the same node under different IPs/node_ids.
+            # Keep the entry with the most recent heartbeat (lowest last_seen seconds).
+            seen_names = {}
+            for node in nodes:
+                name = node['name']
+                if name not in seen_names:
+                    seen_names[name] = node
+                else:
+                    # Prefer the one seen most recently
+                    if node['last_heartbeat_seconds_ago'] < seen_names[name]['last_heartbeat_seconds_ago']:
+                        seen_names[name] = node
+
+            deduped = list(seen_names.values())
+            # Re-assign sequential IDs
+            for i, node in enumerate(deduped, start=1):
+                node['id'] = i
+
+            return deduped
 
         @self.app.get("/api/files")
         async def get_files():
@@ -2756,20 +2774,27 @@ class TossItNode:
 
         self.peer_refresh_task = asyncio.create_task(self._periodic_peer_refresh())
 
-        self.discovery = ClusterDiscovery(
-            cluster_id=self.config.cluster_id,
-            node_id=self.config.node_id,
-            node_name=self.config.node_name,
-            port=self.config.port,
-            storage_gb=self.config.storage_limit_gb,
-            on_node_discovered=self._on_node_discovered,
-            on_node_lost=self._on_node_lost
-        )
-        await self.discovery.start()
+        # If static peer URLs are configured (Docker / known-topology deployments),
+        # skip mDNS entirely — no risk of double-registering the same node under
+        # two different IPs (hostname vs resolved IP).
+        # mDNS is only used for true zero-config LAN discovery (bare-metal homelab).
+        _use_mdns = not os.environ.get('TOSSIT_PEER_URLS', '').strip()
 
-        # Static peer bootstrap runs after mDNS starts so both discovery
-        # paths are active simultaneously.  Duplicates are harmless.
-        asyncio.create_task(self._bootstrap_static_peers())
+        if _use_mdns:
+            self.discovery = ClusterDiscovery(
+                cluster_id=self.config.cluster_id,
+                node_id=self.config.node_id,
+                node_name=self.config.node_name,
+                port=self.config.port,
+                storage_gb=self.config.storage_limit_gb,
+                on_node_discovered=self._on_node_discovered,
+                on_node_lost=self._on_node_lost
+            )
+            await self.discovery.start()
+            print("Discovery: mDNS enabled (no static peers configured)")
+        else:
+            print("Discovery: mDNS skipped — using static peer URLs")
+            asyncio.create_task(self._bootstrap_static_peers())
 
         registry_url = os.getenv('TOSSIT_REGISTRY_URL')
         if registry_url:
