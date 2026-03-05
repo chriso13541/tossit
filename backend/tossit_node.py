@@ -811,32 +811,23 @@ class TossItNode:
         chunk_paths: list
     ):
         """
-        Write a chunk to staging during streaming upload (NO DATABASE WRITES).
-        Content-addressed: the chunk's SHA-256 hash IS its filename.
+        Write a chunk to staging. Accepts a bytearray but immediately writes
+        it without making a second copy — bytearray is writable directly.
         """
-        chunk_data = bytes(chunk_buffer)
-        chunk_size = len(chunk_data)
-
-        chunk_checksum = hashlib.sha256(chunk_data).hexdigest()
+        chunk_size = len(chunk_buffer)
+        chunk_checksum = hashlib.sha256(chunk_buffer).hexdigest()
 
         stage_dir = self.staging_dir / temp_id
         stage_dir.mkdir(exist_ok=True, parents=True)
         chunk_path = stage_dir / f"{chunk_checksum}.dat"
 
+        # Write directly from bytearray — no bytes() copy needed
+        buf_view = memoryview(chunk_buffer)
         def write_chunk():
             with open(chunk_path, 'wb') as f:
-                f.write(chunk_data)
+                f.write(buf_view)
 
         await asyncio.to_thread(write_chunk)
-
-        def verify_chunk():
-            with open(chunk_path, 'rb') as f:
-                written_data = f.read()
-            return hashlib.sha256(written_data).hexdigest()
-
-        written_checksum = await asyncio.to_thread(verify_chunk)
-        if written_checksum != chunk_checksum:
-            raise Exception(f"Chunk {chunk_index} verification failed: checksum mismatch after write")
 
         chunk_meta_list.append({
             'chunk_index': chunk_index,
@@ -844,9 +835,7 @@ class TossItNode:
             'chunk_hash': chunk_checksum,
         })
         chunk_paths.append(chunk_path)
-
         print(f"Chunk {chunk_index}: {chunk_size:,} bytes → {chunk_checksum[:12]}...")
-
         await asyncio.sleep(0)
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
@@ -1848,28 +1837,43 @@ class TossItNode:
                         # A redirect to an internal IP (172.18.x.x) would be unreachable
                         # from outside the Docker network.
                         print(f"Proxying upload to leader at {leader_url}")
+                        # Stream directly — never buffer the whole file in RAM.
                         file.file.seek(0)
-                        file_bytes = await file.read()
                         import aiohttp as _aiohttp
                         async with _aiohttp.ClientSession() as _session:
                             form = _aiohttp.FormData()
-                            form.add_field('file', file_bytes,
-                                           filename=file.filename,
-                                           content_type=file.content_type or 'application/octet-stream')
-                            async with _session.post(leader_url, data=form,
-                                                     timeout=_aiohttp.ClientTimeout(total=3600)) as _resp:
-                                _body = await _resp.json()
+                            form.add_field(
+                                'file',
+                                file.file,
+                                filename=file.filename,
+                                content_type=file.content_type or 'application/octet-stream'
+                            )
+                            async with _session.post(
+                                leader_url, data=form,
+                                timeout=_aiohttp.ClientTimeout(
+                                    total=None,        # no overall cap
+                                    connect=10,
+                                    sock_read=300      # 5 min stall timeout
+                                )
+                            ) as _resp:
+                                _body_text = await _resp.text()
                                 if _resp.status != 200:
-                                    raise HTTPException(_resp.status, detail=_body)
-                                return _body
+                                    raise HTTPException(_resp.status, detail=_body_text)
+                                import json as _json
+                                try:
+                                    return _json.loads(_body_text)
+                                except Exception:
+                                    raise HTTPException(500, detail=f"Leader returned unexpected response: {_body_text[:200]}")
                     else:
                         raise HTTPException(503, "No leader available - cluster electing")
 
                 if recently_was_leader:
                     print(f"Accepting upload during leadership grace period ({time.time() - self._leadership_lost_at:.1f}s since step-down)")
 
-            CHUNK_SIZE = 64 * 1024 * 1024
-            READ_SIZE = 8192
+            # 8 MB chunks — enough for content-addressing without
+            # holding large buffers in RAM on low-end hardware.
+            CHUNK_SIZE = 8 * 1024 * 1024
+            READ_SIZE  = 64 * 1024   # 64 KB reads — good balance of syscall overhead vs RAM
 
             file.file.seek(0, 2)
             file_size = file.file.tell()
@@ -1901,7 +1905,8 @@ class TossItNode:
             chunk_meta_list = []
 
             try:
-                # PHASE 1: Stream to disk (concurrency-limited)
+                # PHASE 1: Stream directly to disk, one chunk at a time.
+                # Peak RAM = one 8 MB bytearray — constant regardless of file size.
                 async with self._upload_semaphore:
                     print(f"Streaming started: {file.filename}")
 
@@ -1925,13 +1930,12 @@ class TossItNode:
                                 chunk_buffer, chunk_meta_list, chunk_paths_temp
                             )
                             chunk_index += 1
-                            chunk_buffer.clear()
+                            chunk_buffer = bytearray()   # new alloc — releases old memory immediately
 
-                            if chunk_index % 10 == 0:
+                            if chunk_index % 20 == 0:
                                 print(f"Progress: {chunk_index} chunks ({total_bytes_read / (1024**3):.2f} GB)")
 
-                        if total_bytes_read % (READ_SIZE * 100) == 0:
-                            await asyncio.sleep(0)
+                        await asyncio.sleep(0)  # yield every read — keeps heartbeats alive
 
                     if chunk_buffer:
                         await self._write_chunk_to_disk(
@@ -2836,7 +2840,9 @@ class TossItNode:
             self.app,
             host="0.0.0.0",
             port=self.config.port,
-            log_level="info"
+            log_level="info",
+            h11_max_incomplete_event_size=None,  # no request size cap (default 16KB header limit only)
+            timeout_keep_alive=600,              # keep connection alive for large uploads
         )
         server = uvicorn.Server(config)
 
