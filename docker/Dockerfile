@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
 COPY backend/*.py ./
+COPY frontend/ ../frontend/
 
 # All persistent state lives here — mount a volume to persist, or leave
 # unmounted for ephemeral test nodes (data dies with the container).
