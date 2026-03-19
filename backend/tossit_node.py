@@ -43,7 +43,7 @@ import uvicorn
 
 
 # Maximum upload size (10 GB)
-MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024 * 1024
+# MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # DATA ROOT — single source of truth for all persistent state.
@@ -506,6 +506,9 @@ class TossItNode:
 
         self._setup_routes()
         print(f"Database initialized: {db_path}")
+
+        self.max_upload_size_bytes = int(config.storage_limit_gb * 1 * 1024 * 1024 * 1024)
+        print(f"Max upload size: {self.max_upload_size_bytes / (1024**3):.1f} GB")
 
     async def _on_node_discovered(self, node_info: dict):
         """Called when a new node is discovered"""
@@ -1880,11 +1883,11 @@ class TossItNode:
             file.file.seek(0)
             file_size_gb = file_size / (1024 ** 3)
 
-            if file_size > MAX_UPLOAD_SIZE_BYTES:
+            if file_size > self.max_upload_size_bytes:
                 raise HTTPException(
                     status_code=413,
                     detail=f"File too large: {file_size / (1024**3):.2f}GB exceeds "
-                           f"max {MAX_UPLOAD_SIZE_BYTES / (1024**3):.0f}GB"
+                           f"max {self.max_upload_size_bytes / (1024**3):.0f}GB"
                 )
 
             space_reserved = await self._reserve_space(file_size_gb)
