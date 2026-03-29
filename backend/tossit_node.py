@@ -32,6 +32,24 @@ from trust_store import TrustStore
 import tempfile
 from fastapi import BackgroundTasks
 
+import uuid6  # UUID v7 — time-ordered, coordination-free file IDs
+
+
+def generate_file_id() -> str:
+    """
+    Generate a UUID v7 string for use as a File primary key.
+
+    UUID v7 encodes a millisecond timestamp in the high 48 bits followed by
+    random bits, giving IDs that are:
+      - Globally unique with no coordination between nodes
+      - Lexicographically sortable by creation time
+      - Safe to generate simultaneously on multiple nodes during a leader
+        failover or concurrent uploads — no collision risk, no central counter
+
+    Example: "019035a2-3b4c-7def-8901-23456789abcd"
+    """
+    return str(uuid6.uuid7())
+
 
 from fastapi import FastAPI, UploadFile, File as FastAPIFile, HTTPException, Query
 from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
@@ -69,6 +87,10 @@ TRUST_STORE_FILE = DATA_ROOT / "trust_store.json"
 # Ensure base directories exist on import so every subsystem can rely on them.
 for _d in (DATA_ROOT, STORAGE_DIR, DB_DIR, KEYS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+# Single source of truth for chunk size used across all upload paths,
+# file model defaults, and the settings API. Change here only.
+CHUNK_SIZE_BYTES = 8 * 1024 * 1024   # 8 MB per chunk
 
 
 async def db_commit_with_retry(db, max_retries=5, base_delay=0.05):
@@ -970,7 +992,7 @@ class TossItNode:
                     else:
                         print(f"Static peer {url} unreachable after 5 attempts: {e}")
 
-    async def _replicate_file_chunks(self, file_id: int):
+    async def _replicate_file_chunks(self, file_id: str):
         """
         Replicate file chunks to peer nodes.
         - N=2 for clusters with 2-4 nodes
@@ -1047,7 +1069,8 @@ class TossItNode:
                     success = await self._send_chunk_from_disk(
                         file_id, chunk, chunk_records,
                         file_metadata,
-                        target_url, target_info, chunk_status, CHUNK_SIZE
+                        target_url, target_info, chunk_status, CHUNK_SIZE,
+                        target_node_id=target_node_id
                     )
                     await asyncio.sleep(0)
 
@@ -1070,7 +1093,8 @@ class TossItNode:
                         success = await self._send_chunk_from_disk(
                             file_id, chunk, chunk_records,
                             file_metadata,
-                            target_url, target_info, chunk_status, CHUNK_SIZE
+                            target_url, target_info, chunk_status, CHUNK_SIZE,
+                            target_node_id=target_node_id
                         )
                         await asyncio.sleep(0)
 
@@ -1100,13 +1124,15 @@ class TossItNode:
             print(f"Replication failed: {e}")
 
     async def _send_chunk_from_disk(
-        self, file_id: int, chunk: dict, chunk_records: list,
+        self, file_id: str, chunk: dict, chunk_records: list,
         file_metadata: dict, target_url: str, target_info: dict,
-        chunk_status: dict, CHUNK_SIZE: int
+        chunk_status: dict, CHUNK_SIZE: int, target_node_id: str = ""
     ) -> bool:
         """
         Read a chunk from disk and send it with ACK verification.
         Reads from content-addressed chunks/ directory by hash.
+        On a verified ACK, records a ChunkLocation row for target_node_id
+        so the leader's replica map stays accurate for download routing.
         """
         idx = chunk['chunk_index']
         checksum = chunk['chunk_hash']
@@ -1154,6 +1180,29 @@ class TossItNode:
                             chunk_status[idx]['sent'] = True
                             chunk_status[idx]['acked'] = True
                             print(f"Chunk {idx + 1}/{len(chunk_records)} ACKed → {target_info['node_name']}")
+
+                            # Record that the remote node now holds this chunk
+                            # so the leader's ChunkLocation table stays accurate
+                            # for download routing and replica-count reporting.
+                            if target_node_id:
+                                _db = self.SessionLocal()
+                                try:
+                                    _existing = _db.query(ChunkLocation).filter(
+                                        ChunkLocation.chunk_hash == checksum,
+                                        ChunkLocation.node_id    == target_node_id,
+                                    ).first()
+                                    if not _existing:
+                                        _db.add(ChunkLocation(
+                                            chunk_hash=checksum,
+                                            node_id=target_node_id,
+                                        ))
+                                        await db_commit_with_retry(_db)
+                                except Exception as _loc_e:
+                                    _db.rollback()
+                                    print(f"Warning: failed to record remote ChunkLocation for {checksum[:12]}...: {_loc_e}")
+                                finally:
+                                    _db.close()
+
                             return True
                         else:
                             print(f"Chunk {idx} invalid ACK response")
@@ -1261,6 +1310,290 @@ class TossItNode:
             max_lat = max(latencies)
             avg_lat = sum(latencies) / len(latencies)
             print(f"Latency range: {min_lat:.1f}ms - {max_lat:.1f}ms (avg: {avg_lat:.1f}ms)")
+
+    def _calculate_chunk_placement(
+        self,
+        file_id: str,
+        total_chunks: int,
+        chunk_size_bytes: int,
+        replication_factor: int = 2
+    ) -> dict:
+        """
+        Calculate optimal primary + replica placement for all chunks across the cluster.
+
+        Returns:
+            { chunk_index: {'primary': node_id_or_'self', 'replicas': [node_id, ...]} }
+
+        Strategy: greedy — assign each chunk's primary to the node with the most
+        remaining free space, then pick replica nodes from the remainder.
+        Tracks cumulative allocation per node so no single node is over-committed.
+        """
+        if not self.peer_nodes:
+            return {i: {'primary': 'self', 'replicas': []} for i in range(total_chunks)}
+
+        self._update_capacity_cached()
+
+        all_nodes = [('self', {
+            'node_name': self.config.node_name,
+            'free_capacity_gb': max(0.0, self.free_capacity_gb - self.reserved_space_gb),
+        })]
+        for node_id, node_info in self.peer_nodes.items():
+            if self.health_monitor:
+                if self.health_monitor.get_peer_status(node_id) != 'online':
+                    continue
+            all_nodes.append((node_id, {
+                'node_name': node_info.get('node_name', node_id[:8]),
+                'free_capacity_gb': float(node_info.get('free_capacity_gb', node_info.get('storage_gb', 0))),
+            }))
+
+        if len(all_nodes) < 2:
+            return {i: {'primary': 'self', 'replicas': []} for i in range(total_chunks)}
+
+        chunk_size_gb = chunk_size_bytes / (1024 ** 3)
+        placement: dict = {}
+        node_allocated: dict = {nid: 0.0 for nid, _ in all_nodes}
+
+        for chunk_idx in range(total_chunks):
+            available = [
+                (nid, info)
+                for nid, info in all_nodes
+                if (info['free_capacity_gb'] - node_allocated[nid]) >= chunk_size_gb
+            ]
+
+            if not available:
+                print(f"WARNING: no node has space for chunk {chunk_idx}, assigning to self as fallback")
+                placement[chunk_idx] = {'primary': 'self', 'replicas': []}
+                continue
+
+            available.sort(key=lambda x: x[1]['free_capacity_gb'] - node_allocated[x[0]], reverse=True)
+            primary_id, _ = available[0]
+            node_allocated[primary_id] += chunk_size_gb
+
+            replica_candidates = [
+                (nid, info)
+                for nid, info in all_nodes
+                if nid != primary_id
+                and (info['free_capacity_gb'] - node_allocated[nid]) >= chunk_size_gb
+            ]
+            replica_candidates.sort(key=lambda x: x[1]['free_capacity_gb'] - node_allocated[x[0]], reverse=True)
+
+            replicas = []
+            for i in range(min(replication_factor - 1, len(replica_candidates))):
+                rid, _ = replica_candidates[i]
+                replicas.append(rid)
+                node_allocated[rid] += chunk_size_gb
+
+            placement[chunk_idx] = {'primary': primary_id, 'replicas': replicas}
+
+            if chunk_idx % 100 == 0 and total_chunks > 100:
+                node_name = dict(all_nodes)[primary_id]['node_name']
+                print(f"Placement progress: {chunk_idx}/{total_chunks} chunks, latest primary={node_name}")
+
+        primary_dist: dict = {}
+        replica_dist: dict = {}
+        for p in placement.values():
+            primary_dist[p['primary']] = primary_dist.get(p['primary'], 0) + 1
+            for r in p['replicas']:
+                replica_dist[r] = replica_dist.get(r, 0) + 1
+        print(f"Chunk placement plan — primaries: {primary_dist}  replicas: {replica_dist}")
+        return placement
+
+    async def _send_chunk_to_node(
+        self,
+        chunk_path,
+        chunk_hash: str,
+        size_bytes: int,
+        target_node_id: str,
+        file_id: str,
+        chunk_index: int,
+        file_metadata: dict,
+        is_primary: bool = False,
+    ) -> bool:
+        """
+        Send a single chunk to a remote node via /api/internal/replicate_chunk.
+        Reuses the existing signed-envelope + ACK protocol.
+        On a verified ACK, records a ChunkLocation row for the remote node
+        in the local database so the leader's replica map stays accurate.
+        Returns True on a verified ACK, False on any error.
+        """
+        import base64 as _b64
+
+        if target_node_id not in self.peer_nodes:
+            print(f"Cannot send chunk {chunk_index}: unknown node {target_node_id[:8]}")
+            return False
+
+        target_info = self.peer_nodes[target_node_id]
+        target_url  = f"http://{target_info['ip_address']}:{target_info['port']}"
+
+        if chunk_path is None or not Path(chunk_path).exists():
+            chunk_path = self.chunks_dir / f"{chunk_hash}.dat"
+        if not Path(chunk_path).exists():
+            print(f"Chunk {chunk_index} not on disk ({chunk_hash[:12]}...) — cannot send to {target_info['node_name']}")
+            return False
+
+        try:
+            chunk_data     = await asyncio.to_thread(Path(chunk_path).read_bytes)
+            chunk_data_b64 = _b64.b64encode(chunk_data).decode('utf-8')
+
+            payload = {
+                'file_id':       file_id,
+                'chunk_index':   chunk_index,
+                'chunk_data':    chunk_data_b64,
+                'checksum':      chunk_hash,
+                'node_name':     self.config.node_name,
+                'timestamp':     time.time(),
+                'file_metadata': file_metadata,
+                'is_primary':    is_primary,
+            }
+            signed = self.identity.sign_json(payload)
+
+            session = await self._get_http_session()
+            async with session.post(
+                f"{target_url}/api/internal/replicate_chunk",
+                json=signed,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                if resp.status == 200:
+                    ack = await resp.json()
+                    if (ack.get('status') == 'ack'
+                            and ack.get('chunk_index') == chunk_index
+                            and ack.get('checksum') == chunk_hash):
+
+                        # Record that the remote node now holds this chunk
+                        # so the leader's ChunkLocation table stays accurate.
+                        _db = self.SessionLocal()
+                        try:
+                            _existing = _db.query(ChunkLocation).filter(
+                                ChunkLocation.chunk_hash == chunk_hash,
+                                ChunkLocation.node_id    == target_node_id,
+                            ).first()
+                            if not _existing:
+                                _db.add(ChunkLocation(
+                                    chunk_hash=chunk_hash,
+                                    node_id=target_node_id,
+                                ))
+                                await db_commit_with_retry(_db)
+                        except Exception as _e:
+                            _db.rollback()
+                            print(f"Warning: failed to record remote ChunkLocation for {chunk_hash[:12]}...: {_e}")
+                        finally:
+                            _db.close()
+
+                        return True
+
+                    print(f"Chunk {chunk_index}: invalid ACK from {target_info['node_name']}")
+                    return False
+                print(f"Chunk {chunk_index}: HTTP {resp.status} from {target_info['node_name']}")
+                return False
+
+        except Exception as e:
+            print(f"Chunk {chunk_index} send error → {target_info['node_name']}: {e}")
+            return False
+
+    async def _distribute_chunks_by_placement(
+        self,
+        file_id: str,
+        chunk_meta_list: list,
+        placement: dict,
+        file_metadata: dict,
+    ):
+        """
+        Distribute chunks across the cluster according to a pre-computed placement plan.
+
+        For each chunk:
+          • primary == 'self'       → keep locally, send replicas to assigned nodes.
+          • primary == remote node  → send to that node (and any replicas), then
+                                      remove the local copy once at least one remote
+                                      copy is confirmed. Falls back to keeping the
+                                      local copy if all sends fail.
+
+        This lets files larger than any single node's free space be stored
+        across the cluster while maintaining the configured replication factor.
+        """
+        print(f"Starting distributed placement for file {file_id} ({len(chunk_meta_list)} chunks)")
+
+        for meta in chunk_meta_list:
+            chunk_idx  = meta['chunk_index']
+            chunk_hash = meta['chunk_hash']
+            size_bytes = meta['size_bytes']
+
+            plan = placement.get(chunk_idx)
+            if not plan:
+                continue
+
+            primary_node  = plan['primary']
+            replica_nodes = plan['replicas']
+            chunk_path    = self.chunks_dir / f"{chunk_hash}.dat"
+
+            remote_copies = 0
+
+            # ── primary is a remote node ──────────────────────────────────
+            if primary_node != 'self':
+                ok = await self._send_chunk_to_node(
+                    chunk_path, chunk_hash, size_bytes,
+                    primary_node, file_id, chunk_idx,
+                    file_metadata, is_primary=True,
+                )
+                if ok:
+                    remote_copies += 1
+                    print(f"Chunk {chunk_idx}: primary → {self.peer_nodes[primary_node]['node_name']}")
+                else:
+                    print(f"Chunk {chunk_idx}: primary send failed, keeping local copy as fallback")
+
+            # ── send replicas (local copy still present at this point) ────
+            for rid in replica_nodes:
+                if rid == 'self':
+                    continue
+                ok = await self._send_chunk_to_node(
+                    chunk_path, chunk_hash, size_bytes,
+                    rid, file_id, chunk_idx,
+                    file_metadata, is_primary=False,
+                )
+                if ok:
+                    remote_copies += 1
+                    print(f"Chunk {chunk_idx}: replica → {self.peer_nodes[rid]['node_name']}")
+
+            # ── remove local copy only if primary is remote AND at least
+            #    one remote node confirmed receipt ──────────────────────────
+            if primary_node != 'self' and remote_copies > 0:
+                async with self._db_write_semaphore:
+                    db = self.SessionLocal()
+                    try:
+                        db.query(ChunkLocation).filter(
+                            ChunkLocation.chunk_hash == chunk_hash,
+                            ChunkLocation.node_id    == self.node_id,
+                        ).delete()
+                        await db_commit_with_retry(db)
+                    except Exception as exc:
+                        db.rollback()
+                        print(f"Chunk {chunk_idx}: failed to remove local ChunkLocation — {exc}")
+                    finally:
+                        db.close()
+
+                try:
+                    chunk_path.unlink(missing_ok=True)
+                    print(f"Chunk {chunk_idx}: local copy removed ({remote_copies} remote copies confirmed)")
+                except Exception as exc:
+                    print(f"Chunk {chunk_idx}: could not unlink local file — {exc}")
+
+            await asyncio.sleep(0)
+
+        # Mark file as replicated
+        async with self._db_write_semaphore:
+            db = self.SessionLocal()
+            try:
+                record = db.query(FileModel).filter(FileModel.id == file_id).first()
+                if record:
+                    record.is_replicated = True
+                    await db_commit_with_retry(db)
+                    print(f"File {file_id} marked as replicated (distributed placement)")
+            except Exception as exc:
+                db.rollback()
+                print(f"Error marking file {file_id} as replicated: {exc}")
+            finally:
+                db.close()
+
+        print(f"Distributed placement complete for file {file_id}")
 
     async def _decrement_assignment(self, node_id: str = "self"):
         """Decrement the assignment counter when an upload completes."""
@@ -1767,9 +2100,10 @@ class TossItNode:
                 db = self.SessionLocal()
                 try:
                     placeholder = FileModel(
+                        id=generate_file_id(),
                         filename=filename,
                         total_size_bytes=size,
-                        chunk_size_bytes=64 * 1024 * 1024,
+                        chunk_size_bytes=CHUNK_SIZE_BYTES,
                         total_chunks=0,
                         checksum_sha256="pending_delegation",
                         uploaded_by="delegated",
@@ -1808,7 +2142,8 @@ class TossItNode:
         @self.app.post("/api/upload")
         async def upload_file(
             file: UploadFile = FastAPIFile(...),
-            delegated_file_id: Optional[int] = Query(None, description="Pre-assigned file ID from leader for delegated uploads")
+            delegated_file_id: Optional[str] = Query(None, description="Pre-assigned file ID (UUID v7) from leader for delegated uploads"),
+            distributed: bool = Query(True, description="Distribute chunks across cluster nodes instead of replicating the whole file to N nodes")
         ):
             """
             STREAMING Upload with constant memory usage.
@@ -1823,15 +2158,13 @@ class TossItNode:
             if is_delegated:
                 print(f"Delegated upload received: {file.filename} (file_id={delegated_file_id})")
             else:
-                LEADER_GRACE_PERIOD = 30
                 is_current_leader = self.raft and self.raft.is_leader()
-                recently_was_leader = (
-                    not is_current_leader and
-                    self._leadership_lost_at > 0 and
-                    (time.time() - self._leadership_lost_at) < LEADER_GRACE_PERIOD
-                )
 
-                if self.raft and not is_current_leader and not recently_was_leader:
+                # No grace period — a node that lost leadership must not accept
+                # new uploads. The grace period caused split-brain where two nodes
+                # could both assign autoincrement file IDs from separate SQLite DBs,
+                # producing ID collisions on the next reconciliation.
+                if self.raft and not is_current_leader:
                     leader_id = self.raft.get_leader_id()
                     if leader_id and leader_id in self.peer_nodes:
                         peer = self.peer_nodes[leader_id]
@@ -1868,14 +2201,10 @@ class TossItNode:
                                 except Exception:
                                     raise HTTPException(500, detail=f"Leader returned unexpected response: {_body_text[:200]}")
                     else:
-                        raise HTTPException(503, "No leader available - cluster electing")
+                        raise HTTPException(503, "No leader available — cluster is electing, retry shortly")
 
-                if recently_was_leader:
-                    print(f"Accepting upload during leadership grace period ({time.time() - self._leadership_lost_at:.1f}s since step-down)")
-
-            # 8 MB chunks — enough for content-addressing without
-            # holding large buffers in RAM on low-end hardware.
-            CHUNK_SIZE = 8 * 1024 * 1024
+            # Use the module-level constant — single source of truth for chunk size.
+            CHUNK_SIZE = CHUNK_SIZE_BYTES
             READ_SIZE  = 64 * 1024   # 64 KB reads — good balance of syscall overhead vs RAM
 
             file.file.seek(0, 2)
@@ -1889,6 +2218,24 @@ class TossItNode:
                     detail=f"File too large: {file_size / (1024**3):.2f}GB exceeds "
                            f"max {self.max_upload_size_bytes / (1024**3):.0f}GB"
                 )
+
+            # Cluster-wide capacity guard for distributed uploads.
+            # Required = file_size × replication_factor must fit in total free space.
+            if distributed and self.peer_nodes:
+                _total_nodes  = 1 + len(self.peer_nodes)
+                _rep_factor   = 2 if _total_nodes <= 4 else 3
+                _cluster_free = max(0.0, self.free_capacity_gb - self.reserved_space_gb)
+                for _ni in self.peer_nodes.values():
+                    _cluster_free += float(_ni.get('free_capacity_gb', 0))
+                _required = file_size_gb * _rep_factor
+                if _required > _cluster_free:
+                    raise HTTPException(
+                        status_code=507,
+                        detail=(
+                            f"Cluster cannot store this file with {_rep_factor}x replication: "
+                            f"need {_required:.2f} GB total, cluster has {_cluster_free:.2f} GB free"
+                        ),
+                    )
 
             space_reserved = await self._reserve_space(file_size_gb)
             if not space_reserved:
@@ -1950,6 +2297,20 @@ class TossItNode:
                 file_checksum = file_hash.hexdigest()
 
                 # PHASE 2: Atomic DB commit
+                # Fencing check: verify we are still leader before writing metadata.
+                # A node that lost leadership between Phase 1 (streaming) and here
+                # must not commit — doing so would create file IDs from a stale
+                # autoincrement sequence that may collide with the new leader's IDs.
+                if not is_delegated and self.raft and not self.raft.is_leader():
+                    await self._release_reservation(file_size_gb)
+                    import shutil as _shutil
+                    _shutil.rmtree(self.staging_dir / temp_id, ignore_errors=True)
+                    raise HTTPException(
+                        503,
+                        "Leadership changed during upload — please retry. "
+                        "The file data was not committed."
+                    )
+
                 async with self._db_write_semaphore:
                     db = self.SessionLocal()
                     try:
@@ -1967,6 +2328,7 @@ class TossItNode:
                             )
                         else:
                             file_record = FileModel(
+                                id=generate_file_id(),
                                 filename=file.filename,
                                 total_size_bytes=file_size,
                                 chunk_size_bytes=CHUNK_SIZE,
@@ -2035,7 +2397,27 @@ class TossItNode:
                     await self._decrement_assignment("self")
 
                 if len(self.peer_nodes) > 0:
-                    asyncio.create_task(self._replicate_file_chunks(file_id))
+                    if distributed:
+                        _rep_factor = 2 if (1 + len(self.peer_nodes)) <= 4 else 3
+                        _file_meta  = {
+                            'filename':         file.filename,
+                            'total_size_bytes': file_size,
+                            'chunk_size_bytes': CHUNK_SIZE,
+                            'total_chunks':     chunk_index,
+                            'checksum_sha256':  file_checksum,
+                            'uploaded_by':      'delegated' if is_delegated else 'web_user',
+                        }
+                        _placement = self._calculate_chunk_placement(
+                            file_id=file_id,
+                            total_chunks=chunk_index,
+                            chunk_size_bytes=CHUNK_SIZE,
+                            replication_factor=_rep_factor,
+                        )
+                        asyncio.create_task(self._distribute_chunks_by_placement(
+                            file_id, list(chunk_meta_list), _placement, _file_meta
+                        ))
+                    else:
+                        asyncio.create_task(self._replicate_file_chunks(file_id))
 
                 return {
                     "message": "File uploaded successfully (streaming)",
@@ -2204,13 +2586,36 @@ class TossItNode:
                 "received_at": time.time()
             }
 
-        @self.app.get("/api/download/{file_id}")
-        async def download_file(file_id: int):
+        @self.app.get("/api/internal/get_chunk/{chunk_hash}")
+        async def get_chunk_data(chunk_hash: str):
             """
-            Download a file — streams chunks directly from disk.
-            Content-addressed: looks up FileChunk mappings to find chunk hashes,
-            then reads from chunks/{hash}.dat in order.
-            Memory usage: ~64MB (one chunk at a time).
+            Serve the raw bytes of a locally-stored chunk to peer nodes.
+            Called by the download handler on any node when a chunk's
+            primary lives on a remote node after distributed placement.
+            """
+            if len(chunk_hash) != 64:
+                raise HTTPException(status_code=400, detail="Invalid chunk hash length")
+            chunk_path = self.chunks_dir / f"{chunk_hash}.dat"
+            if not chunk_path.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Chunk {chunk_hash[:12]}... not found on this node"
+                )
+            return FileResponse(
+                str(chunk_path),
+                media_type="application/octet-stream",
+                headers={"X-Chunk-Hash": chunk_hash},
+            )
+
+        @self.app.get("/api/download/{file_id}")
+        async def download_file(file_id: str):
+            """
+            Download a file — streams chunks in order, fetching each chunk from
+            whichever node holds a copy (local disk first, then remote peer).
+
+            With distributed chunk placement, some chunks live on peer nodes.
+            Those are fetched transparently via /api/internal/get_chunk/ and
+            are never buffered whole — one chunk at a time regardless of file size.
             """
             from starlette.responses import StreamingResponse
 
@@ -2223,7 +2628,7 @@ class TossItNode:
                 if not file_record.is_complete:
                     raise HTTPException(status_code=409, detail="File upload not complete")
 
-                filename = file_record.filename
+                filename   = file_record.filename
                 total_size = file_record.total_size_bytes
                 total_chunks = file_record.total_chunks
 
@@ -2233,23 +2638,75 @@ class TossItNode:
                     FileChunk.file_id == file_id
                 ).order_by(FileChunk.chunk_index).all()
 
-                chunk_paths = []
+                # Build fetch plan before closing the DB session.
+                # Each entry: (chunk_hash, local_path_or_None, remote_node_id_or_None)
+                fetch_plan = []
                 for fc in file_chunks:
-                    chunk_path = self.chunks_dir / f"{fc.chunk_hash}.dat"
-                    if not chunk_path.exists():
+                    local_path = self.chunks_dir / f"{fc.chunk_hash}.dat"
+                    if local_path.exists():
+                        fetch_plan.append((fc.chunk_hash, local_path, None))
+                        continue
+
+                    # Chunk not local — find an online peer that holds it.
+                    # ChunkLocation rows for remote nodes are written by
+                    # _send_chunk_to_node / _send_chunk_from_disk on ACK,
+                    # so this query is accurate even after distributed placement.
+                    locations = db.query(ChunkLocation).filter(
+                        ChunkLocation.chunk_hash == fc.chunk_hash,
+                        ChunkLocation.node_id    != self.node_id,
+                    ).all()
+
+                    remote_node_id = None
+                    for loc in locations:
+                        if loc.node_id not in self.peer_nodes:
+                            continue
+                        if self.health_monitor:
+                            if self.health_monitor.get_peer_status(loc.node_id) != 'online':
+                                continue
+                        remote_node_id = loc.node_id
+                        break
+
+                    if remote_node_id:
+                        fetch_plan.append((fc.chunk_hash, None, remote_node_id))
+                    else:
                         raise HTTPException(
                             status_code=500,
-                            detail=f"Missing chunk {fc.chunk_index} ({fc.chunk_hash[:12]}...) for file {file_id}"
+                            detail=(
+                                f"Chunk {fc.chunk_index} ({fc.chunk_hash[:12]}...) is unavailable: "
+                                f"not on local disk and no reachable remote copy found"
+                            ),
                         )
-                    chunk_paths.append(chunk_path)
 
             finally:
                 db.close()
 
             async def chunk_streamer():
-                for chunk_path in chunk_paths:
-                    data = await asyncio.to_thread(chunk_path.read_bytes)
-                    yield data
+                _session = await self._get_http_session()
+                for chunk_hash, local_path, remote_node_id in fetch_plan:
+                    if local_path is not None:
+                        data = await asyncio.to_thread(local_path.read_bytes)
+                        yield data
+                    else:
+                        peer = self.peer_nodes[remote_node_id]
+                        remote_url = (
+                            f"http://{peer['ip_address']}:{peer['port']}"
+                            f"/api/internal/get_chunk/{chunk_hash}"
+                        )
+                        async with _session.get(
+                            remote_url,
+                            timeout=aiohttp.ClientTimeout(total=120),
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                yield data
+                            else:
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail=(
+                                        f"Failed to fetch chunk {chunk_hash[:12]}... "
+                                        f"from {peer['node_name']}: HTTP {resp.status}"
+                                    ),
+                                )
                     await asyncio.sleep(0)
 
             return StreamingResponse(
@@ -2258,11 +2715,11 @@ class TossItNode:
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',
                     "Content-Length": str(total_size),
-                }
+                },
             )
 
         @self.app.delete("/api/files/{file_id}")
-        async def delete_file(file_id: int):
+        async def delete_file(file_id: str):
             """Delete a file. Only removes chunk data if no other file references the chunk."""
             db = self.SessionLocal()
             try:
@@ -2621,7 +3078,7 @@ class TossItNode:
                 db.close()
 
         @self.app.get("/api/files/{file_id}")
-        async def get_file_details(file_id: int):
+        async def get_file_details(file_id: str):
             """Get single file details with chunk locations"""
             db = self.SessionLocal()
             try:
@@ -2686,7 +3143,7 @@ class TossItNode:
         @self.app.get("/api/settings")
         async def get_settings():
             return {
-                "chunk_size_mb": 64,
+                "chunk_size_mb": CHUNK_SIZE_BYTES // (1024 * 1024),
                 "min_replicas": 2,
                 "max_replicas": 3,
                 "replication_strategy": "priority",
@@ -2728,7 +3185,7 @@ class TossItNode:
                 }
             }
 
-    async def _delete_remote_replicas(self, file_id: int, chunk_count: int, chunk_hashes: list = None):
+    async def _delete_remote_replicas(self, file_id: str, chunk_count: int, chunk_hashes: list = None):
         """Send delete requests to all peer nodes to remove replicated chunks."""
         if not self.peer_nodes:
             return
