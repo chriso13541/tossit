@@ -20,6 +20,21 @@ Port usage:
   separate protocols at the OS level — they do not compete for the same
   socket. This means a node only ever needs one port configured, exposed
   in Docker, or opened in a firewall.
+
+Log replication state (Phase 1+):
+  commit_index    — highest log entry confirmed by quorum (cluster-wide)
+  last_applied    — highest log entry this node has applied to its DB
+  snapshot_index  — last log index covered by an installed snapshot (Phase 3)
+
+Per-follower tracking (Phase 1 init, Phase 2 use):
+  next_index[peer]   — next log index to send to that follower
+  match_index[peer]  — highest log index confirmed on that follower
+
+Phase 2 additions:
+  _advance_commit_index(leader_last_log_index) — quorum commit check
+  receive_heartbeat() — now accepts and applies commit_index from leader
+  _thread_send_heartbeats() — now includes commit_index in HTTP message
+    so followers can advance their apply loop between log proposes
 """
 
 import asyncio
@@ -91,8 +106,7 @@ class ClusterRaft:
         self.on_become_leader = on_become_leader
         self.on_lose_leadership = on_lose_leadership
 
-        # Raft state persistence — survive crashes without violating safety.
-        # Without this, a restarted node could vote twice in the same term.
+        # Raft state persistence
         self._state_file = None
         if data_dir:
             import pathlib
@@ -100,11 +114,42 @@ class ClusterRaft:
             state_dir.mkdir(parents=True, exist_ok=True)
             self._state_file = state_dir / "raft_state.json"
 
-        # Raft state (shared between threads — GIL-safe for simple attrs)
+        # ── Core Raft election state (persisted) ──────────────────────
         self.state = NodeState.FOLLOWER
         self.current_term = 0
         self.voted_for: Optional[str] = None
         self.leader_id: Optional[str] = None
+
+        # ── Log replication state (Phase 1+, persisted) ───────────────
+        #
+        # commit_index: highest log index confirmed by a quorum. The leader
+        #   advances this after receiving ACKs from floor(N/2)+1 nodes.
+        #   Followers learn about it via append_entries (Phase 2) and via
+        #   commit_index piggy-backed on HTTP heartbeats.
+        #
+        # last_applied: highest log index this node has applied to its live
+        #   tables (File, FileChunk, Chunk, ChunkLocation). Maintained by the
+        #   _apply_log_entries background loop in TossItNode.
+        #   Invariant: last_applied <= commit_index <= last log index
+        #
+        # snapshot_index: highest log index covered by the most recent
+        #   installed snapshot. Entries at or below this index can be trimmed
+        #   from the raft_log table (Phase 3+).
+        self.commit_index: int = 0
+        self.last_applied: int = 0
+        self.snapshot_index: int = 0
+
+        # ── Per-follower tracking (Phase 2) ───────────────────────────
+        #
+        # next_index[peer]:  next log entry index to send to that follower.
+        #   Initialised to commit_index+1 when a peer joins.
+        #   Decremented on append_entries rejection (log backfill).
+        #
+        # match_index[peer]: highest log entry confirmed replicated on that
+        #   follower. Used by _advance_commit_index to find the quorum
+        #   commit point.
+        self.next_index:  Dict[str, int] = {}
+        self.match_index: Dict[str, int] = {}
 
         # Restore persisted state from disk (if any)
         self._load_persisted_state()
@@ -115,9 +160,7 @@ class ClusterRaft:
         # Cached leader info for pre-vote
         self.leader_peer_info: Optional[dict] = None
 
-        # Per-peer liveness — updated by heartbeat thread when a peer
-        # responds (HTTP 200) or sends us data (UDP). Used by the health
-        # monitor to avoid false "offline" marks during heavy I/O.
+        # Per-peer liveness — updated by heartbeat thread
         self.peer_last_seen: Dict[str, float] = {}
 
         self._has_ever_had_peers = False
@@ -140,6 +183,8 @@ class ClusterRaft:
         print(
             f"Raft initialized for {node_name} "
             f"(term={self.current_term}, "
+            f"commit_index={self.commit_index}, "
+            f"last_applied={self.last_applied}, "
             f"timeout: {election_timeout_min}-{election_timeout_max}s, "
             f"port: {self.port} TCP+UDP)"
         )
@@ -151,25 +196,16 @@ class ClusterRaft:
         self.last_heartbeat = time.time()
         self._main_loop = asyncio.get_running_loop()
 
-        # Open UDP socket for heartbeats.
-        # SO_REUSEPORT lets the UDP socket bind to the same port number
-        # that uvicorn's TCP socket also uses. The kernel demultiplexes by
-        # protocol — they never interfere with each other.
         self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            # SO_REUSEPORT is available on Linux and macOS but not Windows.
             self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except (AttributeError, OSError):
-            # Windows or a kernel build without SO_REUSEPORT — fall back
-            # gracefully. SO_REUSEADDR alone is sufficient on Windows
-            # because it already allows port reuse across protocols there.
             pass
         self._udp_sock.bind(('0.0.0.0', self.udp_port))
-        self._udp_sock.settimeout(1.0)  # 1s recv timeout for clean shutdown
+        self._udp_sock.settimeout(1.0)
         print(f"UDP heartbeat socket bound to :{self.udp_port} (shared with HTTP port)")
 
-        # Launch heartbeat thread
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_thread_run,
             name="raft-heartbeat",
@@ -189,11 +225,25 @@ class ClusterRaft:
         print("✓ Raft stopped")
 
     def update_peers(self, peers: Dict[str, dict]):
-        """Update known peers"""
+        """Update known peers and maintain per-follower tracking state."""
         self.peers = peers.copy()
 
         if len(self.peers) > 0:
             self._has_ever_had_peers = True
+
+        # Initialise per-follower tracking for newly discovered peers.
+        # next_index starts at commit_index+1 (optimistic: assume follower is
+        # up to date). match_index starts at 0 (nothing confirmed yet).
+        for node_id in peers:
+            if node_id not in self.next_index:
+                self.next_index[node_id]  = self.commit_index + 1
+                self.match_index[node_id] = 0
+
+        # Clean up tracking for peers that have left the cluster.
+        departed = [nid for nid in list(self.next_index) if nid not in peers]
+        for node_id in departed:
+            del self.next_index[node_id]
+            del self.match_index[node_id]
 
         if (len(self.peers) == 0
                 and self.state != NodeState.LEADER
@@ -203,31 +253,30 @@ class ClusterRaft:
                 asyncio.run_coroutine_threadsafe(self._become_leader(), self._main_loop)
 
     # ================================================================
-    #  STATE PERSISTENCE — survive crashes without safety violations
+    #  STATE PERSISTENCE
     # ================================================================
 
     def _persist_state(self):
         """
-        Persist current_term and voted_for to disk.
+        Persist Raft state to disk atomically.
 
-        Called every time either value changes. This is the minimum state
-        needed for Raft safety: without it, a restarted node could vote
-        twice in the same term, violating the one-vote-per-term guarantee.
-
-        The write is ~50 bytes to a small JSON file. Even on a busy disk
-        this completes in <1ms. It runs in the heartbeat thread so it
-        doesn't touch the event loop.
+        Persisted fields:
+          current_term, voted_for  — election safety
+          commit_index             — prevents re-committing on restart
+          last_applied             — prevents re-applying on restart
+          snapshot_index           — log compaction boundary (Phase 3)
         """
         if not self._state_file:
             return
 
         try:
             state = {
-                "current_term": self.current_term,
-                "voted_for": self.voted_for,
+                "current_term":   self.current_term,
+                "voted_for":      self.voted_for,
+                "commit_index":   self.commit_index,
+                "last_applied":   self.last_applied,
+                "snapshot_index": self.snapshot_index,
             }
-            # Atomic write: write to temp file, then rename.
-            # Prevents corrupt state if crash occurs mid-write.
             tmp = self._state_file.with_suffix('.tmp')
             tmp.write_text(json.dumps(state))
             tmp.rename(self._state_file)
@@ -235,15 +284,24 @@ class ClusterRaft:
             print(f"Failed to persist Raft state: {e}")
 
     def _load_persisted_state(self):
-        """Load persisted term/vote from disk on startup."""
+        """Load persisted Raft state from disk on startup."""
         if not self._state_file or not self._state_file.exists():
             return
 
         try:
             state = json.loads(self._state_file.read_text())
-            self.current_term = state.get("current_term", 0)
-            self.voted_for = state.get("voted_for", None)
-            print(f"Restored Raft state: term={self.current_term}, voted_for={self.voted_for}")
+            self.current_term   = state.get("current_term", 0)
+            self.voted_for      = state.get("voted_for", None)
+            self.commit_index   = state.get("commit_index", 0)
+            self.last_applied   = state.get("last_applied", 0)
+            self.snapshot_index = state.get("snapshot_index", 0)
+            print(
+                f"Restored Raft state: "
+                f"term={self.current_term}, "
+                f"voted_for={self.voted_for}, "
+                f"commit_index={self.commit_index}, "
+                f"last_applied={self.last_applied}"
+            )
         except Exception as e:
             print(f"Failed to load Raft state (starting fresh): {e}")
 
@@ -257,8 +315,6 @@ class ClusterRaft:
 
         Leader mode:  send UDP + HTTP heartbeats, sleep interval
         Follower mode: recv UDP heartbeats, check election timeout
-
-        Both send and receive use raw sockets / urllib — zero event loop.
         """
         print(f"Heartbeat thread started (interval={self.heartbeat_interval}s)")
 
@@ -268,7 +324,6 @@ class ClusterRaft:
                     self._thread_send_heartbeats()
                     time.sleep(self.heartbeat_interval)
                 else:
-                    # Follower: try to receive UDP heartbeats
                     self._thread_recv_udp_heartbeats()
                     self._thread_check_election()
             except Exception as e:
@@ -278,30 +333,38 @@ class ClusterRaft:
         print(f"Heartbeat thread stopped")
 
     def _thread_send_heartbeats(self):
-        """Send UDP + HTTP heartbeats to all peers (leader only)"""
+        """
+        Send UDP + HTTP heartbeats to all peers (leader only).
+
+        Phase 2: commit_index is now included in the HTTP message so
+        followers can advance their apply loop even between log proposes.
+        The heartbeat thread sends to /api/raft/heartbeat which is kept
+        as a backward-compat shim on Phase 2 nodes. Phase 3+ may switch
+        this to /api/raft/append_entries directly.
+        """
         for node_id, peer_info in list(self.peers.items()):
             peer_ip   = peer_info['ip_address']
             peer_port = peer_info['port']
-            # UDP heartbeat goes to the same port number as HTTP.
-            # The peer's kernel routes it to the UDP socket automatically.
-            peer_udp_port = peer_port
 
             # --- UDP heartbeat (fast, timing-critical) ---
             try:
                 packet = self._build_udp_heartbeat()
-                self._udp_sock.sendto(packet, (peer_ip, peer_udp_port))
+                self._udp_sock.sendto(packet, (peer_ip, peer_port))
             except Exception:
                 pass
 
             # --- HTTP heartbeat (authoritative, state-critical) ---
+            # Phase 2: commit_index is piggybacked so followers can
+            # advance their apply loop between raft_propose calls.
             try:
                 peer_url = f"http://{peer_ip}:{peer_port}/api/raft/heartbeat"
 
                 heartbeat_message = {
-                    'leader_id': self.node_id,
-                    'term': self.current_term,
-                    'node_name': self.node_name,
-                    'timestamp': time.time(),
+                    'leader_id':   self.node_id,
+                    'term':        self.current_term,
+                    'node_name':   self.node_name,
+                    'commit_index': self.commit_index,   # Phase 2 addition
+                    'timestamp':   time.time(),
                 }
 
                 if self.identity:
@@ -318,7 +381,6 @@ class ClusterRaft:
 
                 with urllib.request.urlopen(req, timeout=3.0) as resp:
                     if resp.status == 200:
-                        # Peer confirmed alive — update liveness tracker
                         self.peer_last_seen[node_id] = time.time()
             except Exception:
                 pass
@@ -330,40 +392,35 @@ class ClusterRaft:
         Receive UDP heartbeats from leader (follower only).
 
         The socket has a 1s timeout, so this naturally paces the election
-        check loop without busy-waiting. When a heartbeat arrives, we
-        update last_heartbeat directly — no event loop.
+        check loop without busy-waiting.
         """
         try:
             data, addr = self._udp_sock.recvfrom(1024)
 
             if len(data) < UDP_HEADER.size + 4:
-                return  # Runt packet
+                return
 
-            # Parse header
             magic_bytes = data[:4]
             magic = struct.unpack('!I', magic_bytes)[0]
             if magic != UDP_MAGIC:
-                return  # Not our packet
+                return
 
             term, ts = UDP_HEADER.unpack_from(data, 4)
             sender_id = data[4 + UDP_HEADER.size:].decode('utf-8', errors='ignore')
 
-            # Update heartbeat timestamp — this is the critical line that
-            # prevents elections. It runs in THIS thread, not the event loop.
+            # Update heartbeat timestamp — prevents spurious elections
             self.last_heartbeat = time.time()
 
-            # Track peer liveness
             if sender_id:
                 self.peer_last_seen[sender_id] = time.time()
 
-            # Update term if higher (leader changed while we were busy)
             if term > self.current_term:
                 self.current_term = term
                 self.leader_id = sender_id
                 self._persist_state()
 
         except socket.timeout:
-            pass  # No UDP heartbeat received — election check will handle it
+            pass
         except Exception:
             pass
 
@@ -381,9 +438,6 @@ class ClusterRaft:
         if elapsed <= self.election_timeout:
             return
 
-        # No UDP heartbeat for election_timeout seconds.
-        # Since UDP bypasses the event loop entirely, this means the leader
-        # is genuinely unreachable — not just busy with uploads.
         print(f"Election timeout ({self.election_timeout:.1f}s) — no UDP heartbeat, starting election")
         self._thread_start_election()
 
@@ -396,7 +450,7 @@ class ClusterRaft:
         self.current_term += 1
         self.voted_for = self.node_id
         self.leader_id = None
-        self._persist_state()  # Persist before requesting votes
+        self._persist_state()
 
         print(f"Starting election for term {self.current_term}")
 
@@ -458,6 +512,14 @@ class ClusterRaft:
 
         if not was_leader:
             print(f"Became leader for term {self.current_term}")
+
+            # Re-initialise per-follower tracking on each new leadership term.
+            # next_index resets to commit_index+1 so the leader can discover
+            # where each follower's log diverges via the backfill mechanism.
+            for node_id in self.peers:
+                self.next_index[node_id]  = self.commit_index + 1
+                self.match_index[node_id] = 0
+
             if self.on_become_leader:
                 await self.on_become_leader()
 
@@ -472,17 +534,79 @@ class ClusterRaft:
                 await self.on_lose_leadership()
 
     # ================================================================
+    #  COMMIT INDEX ADVANCEMENT (Phase 2)
+    # ================================================================
+
+    def _advance_commit_index(self, leader_last_log_index: int) -> bool:
+        """
+        Advance commit_index to the highest index confirmed by a quorum.
+
+        Called by the leader in TossItNode.raft_propose() after collecting
+        append_entries ACKs from followers. Also callable after any update
+        to match_index (e.g. periodic heartbeat ACKs in Phase 3+).
+
+        Algorithm:
+          Collect all confirmed indices: the leader itself always has
+          leader_last_log_index, plus each follower's match_index.
+          Sort descending. The quorum-th element (0-indexed at quorum-1)
+          is the highest index confirmed by at least quorum nodes.
+          Only advance if that candidate > current commit_index.
+
+        The Raft term-check safety rule: a leader must not commit entries
+        from previous terms by count alone — it must first commit an entry
+        from the current term, which then implicitly commits all prior
+        entries. For Phase 2, raft_propose only proposes entries in the
+        current term and calls _advance_commit_index immediately, so the
+        term-check is implicitly satisfied. A full check will be added in
+        Phase 3 when log compaction is introduced.
+
+        Returns True if commit_index was advanced, False otherwise.
+        """
+        total_nodes = 1 + len(self.peers)      # leader + followers
+        quorum_size = total_nodes // 2 + 1      # floor(N/2) + 1
+
+        # Build sorted (descending) list of confirmed log indices.
+        # leader_last_log_index represents the leader's own position.
+        all_confirmed = sorted(
+            [leader_last_log_index] + [self.match_index.get(nid, 0) for nid in self.peers],
+            reverse=True,
+        )
+
+        # The quorum_size-th highest value (0-indexed: quorum_size - 1)
+        # is the highest index that at least quorum_size nodes have.
+        if len(all_confirmed) < quorum_size:
+            return False
+
+        candidate = all_confirmed[quorum_size - 1]
+
+        if candidate > self.commit_index:
+            self.commit_index = candidate
+            self._persist_state()
+            print(f"Raft: commit_index advanced to {self.commit_index} (quorum={quorum_size}/{total_nodes})")
+            return True
+
+        return False
+
+    # ================================================================
     #  INBOUND HANDLERS — called from main event loop (FastAPI routes)
     # ================================================================
 
-    async def receive_heartbeat(self, leader_id: str, term: int):
+    async def receive_heartbeat(
+        self, leader_id: str, term: int, commit_index: int = 0
+    ) -> bool:
         """
-        Handle incoming HTTP heartbeat from leader.
+        Handle incoming HTTP heartbeat or append_entries from leader.
 
-        This handles Raft state logic (term updates, step-downs).
-        The timing-critical last_heartbeat update is handled by UDP,
-        but we also update it here as defense-in-depth.
+        Phase 2: now accepts commit_index from the leader so followers can
+        advance their apply loop between raft_propose calls (when no new
+        entries are being proposed, the heartbeat thread carries the
+        current commit_index so followers don't stall).
+
+        Returns True if commit_index was advanced (caller should wake the
+        _apply_log_entries event).
         """
+        commit_advanced = False
+
         if term > self.current_term:
             self.current_term = term
             self.voted_for = None
@@ -492,7 +616,7 @@ class ClusterRaft:
 
         if term == self.current_term:
             self.leader_id = leader_id
-            self.last_heartbeat = time.time()  # Defense-in-depth
+            self.last_heartbeat = time.time()  # Defense-in-depth alongside UDP
 
             if leader_id in self.peers:
                 self.leader_peer_info = self.peers[leader_id].copy()
@@ -500,6 +624,16 @@ class ClusterRaft:
             if self.state == NodeState.LEADER and leader_id != self.node_id:
                 print(f"Another leader detected ({leader_id}), stepping down")
                 await self._become_follower()
+
+            # Advance commit_index if leader has committed further than us.
+            # This lets followers apply committed entries without waiting for
+            # the next raft_propose fan-out to carry a new commit_index.
+            if commit_index > self.commit_index:
+                self.commit_index = commit_index
+                self._persist_state()
+                commit_advanced = True
+
+        return commit_advanced
 
     async def request_vote(self, candidate_id: str, term: int) -> bool:
         if term < self.current_term:
@@ -514,7 +648,7 @@ class ClusterRaft:
         if self.voted_for is None or self.voted_for == candidate_id:
             self.voted_for = candidate_id
             self.last_heartbeat = time.time()
-            self._persist_state()  # Persist vote before confirming
+            self._persist_state()
             print(f"Voted for {candidate_id} in term {term}")
             return True
 
@@ -533,15 +667,27 @@ class ClusterRaft:
     def get_state(self) -> str:
         return self.state.value
 
-    def is_peer_alive(self, node_id: str, max_age: float = 30.0) -> bool:
-        """
-        Check if a peer has been seen recently by the heartbeat thread.
+    def get_commit_index(self) -> int:
+        return self.commit_index
 
-        Used by the health monitor to avoid marking nodes offline when
-        the main event loop is too busy to process health check responses.
-        If the heartbeat thread has communicated with the peer recently,
-        the peer is definitely alive.
+    def get_last_applied(self) -> int:
+        return self.last_applied
+
+    def get_snapshot_index(self) -> int:
+        return self.snapshot_index
+
+    def update_snapshot_index(self, index: int):
         """
+        Update snapshot_index and persist. Called by TossItNode after
+        _take_snapshot() or _apply_snapshot_to_db() completes so the
+        value survives a crash.
+        """
+        if index > self.snapshot_index:
+            self.snapshot_index = index
+            self._persist_state()
+
+    def is_peer_alive(self, node_id: str, max_age: float = 30.0) -> bool:
+        """Check if a peer has been seen recently by the heartbeat thread."""
         last_seen = self.peer_last_seen.get(node_id, 0)
         return (time.time() - last_seen) < max_age
 
@@ -567,7 +713,12 @@ async def main():
     try:
         while True:
             await asyncio.sleep(2)
-            print(f"State: {raft.get_state()}, Leader: {raft.get_leader_id()}")
+            print(
+                f"State: {raft.get_state()}, "
+                f"Leader: {raft.get_leader_id()}, "
+                f"commit_index: {raft.get_commit_index()}, "
+                f"last_applied: {raft.get_last_applied()}"
+            )
     except KeyboardInterrupt:
         pass
     finally:
