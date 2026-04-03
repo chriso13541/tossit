@@ -1803,36 +1803,131 @@ class TossItNode:
         print(f"Selected {len(selected)} replica node(s) for replication")
         return selected
 
-    def _calculate_chunk_placement(self, file_id, total_chunks, chunk_size_bytes, replication_factor=2):
+    def _calculate_chunk_placement(
+        self,
+        file_id,
+        total_chunks,
+        chunk_size_bytes,
+        replication_factor=2,
+        strategy: str = 'proportional',
+    ):
+        """
+        Calculate primary + replica placement for all chunks of a file.
+
+        strategy options
+        ────────────────
+        'proportional' (default)
+            Each node receives primaries in proportion to its total capacity.
+            A node with 2× the storage gets 2× the primaries. For equal-capacity
+            nodes this is identical to strict round-robin. This is the right
+            default for homelab clusters where nodes have the same or similar
+            storage — the leader keeps its fair share instead of offloading
+            everything to peers just because it temporarily has less free space
+            after receiving the upload.
+
+        'greedy'
+            Always assigns the primary to the node with the most remaining free
+            space (current free − already allocated this session). Prevents any
+            single node from filling up first. Better for heterogeneous clusters
+            where nodes have meaningfully different storage capacities, or for
+            very large uploads where free-space differences matter.
+
+        In both strategies replicas are placed on the nodes with the most
+        remaining free space (excluding the primary), so the replication
+        factor is always respected and no replica goes to an overfull node.
+        """
         if not self.peer_nodes:
             return {i: {'primary': 'self', 'replicas': []} for i in range(total_chunks)}
+
         self._update_capacity_cached()
-        all_nodes = [('self', {'node_name': self.config.node_name, 'free_capacity_gb': max(0.0, self.free_capacity_gb - self.reserved_space_gb)})]
+
+        # Build the candidate list.  For 'proportional', we need total_capacity_gb
+        # per node so we can compute fair-share weights.
+        all_nodes = [('self', {
+            'node_name':        self.config.node_name,
+            'free_capacity_gb': max(0.0, self.free_capacity_gb - self.reserved_space_gb),
+            'total_capacity_gb': self.config.storage_limit_gb,
+        })]
         for node_id, node_info in self.peer_nodes.items():
             if self.health_monitor and self.health_monitor.get_peer_status(node_id) != 'online':
                 continue
-            all_nodes.append((node_id, {'node_name': node_info.get('node_name', node_id[:8]), 'free_capacity_gb': float(node_info.get('free_capacity_gb', node_info.get('storage_gb', 0)))}))
+            all_nodes.append((node_id, {
+                'node_name':        node_info.get('node_name', node_id[:8]),
+                'free_capacity_gb': float(node_info.get('free_capacity_gb', node_info.get('storage_gb', 0))),
+                'total_capacity_gb': float(node_info.get('storage_gb', 0)),
+            }))
+
         if len(all_nodes) < 2:
             return {i: {'primary': 'self', 'replicas': []} for i in range(total_chunks)}
-        chunk_size_gb = chunk_size_bytes / (1024 ** 3)
-        placement: dict = {}
-        node_allocated: dict = {nid: 0.0 for nid, _ in all_nodes}
+
+        chunk_size_gb    = chunk_size_bytes / (1024 ** 3)
+        total_cluster_gb = sum(info['total_capacity_gb'] for _, info in all_nodes) or 1.0
+        placement:        dict = {}
+        node_allocated:   dict = {nid: 0.0 for nid, _ in all_nodes}
+
         for chunk_idx in range(total_chunks):
-            available = [(nid, info) for nid, info in all_nodes if (info['free_capacity_gb'] - node_allocated[nid]) >= chunk_size_gb]
+            # Filter to nodes that still have room for one more chunk
+            available = [
+                (nid, info) for nid, info in all_nodes
+                if (info['free_capacity_gb'] - node_allocated[nid]) >= chunk_size_gb
+            ]
             if not available:
+                print(f"WARNING: no node has space for chunk {chunk_idx}, assigning to self as fallback")
                 placement[chunk_idx] = {'primary': 'self', 'replicas': []}
                 continue
-            available.sort(key=lambda x: x[1]['free_capacity_gb'] - node_allocated[x[0]], reverse=True)
+
+            if strategy == 'proportional':
+                # Sort by "how far below its fair share is this node?"
+                # fair_share = (node_total_capacity / cluster_total_capacity) * total_chunks
+                # under_share = fair_share_chunks - already_allocated_chunks
+                # Higher under_share → more deserving of the next primary.
+                # For equal-capacity nodes this is strict round-robin.
+                # For unequal nodes the larger node naturally gets more primaries.
+                def proportional_key(item):
+                    nid, info = item
+                    fair_share_gb = (info['total_capacity_gb'] / total_cluster_gb) * total_chunks * chunk_size_gb
+                    under_share   = fair_share_gb - node_allocated[nid]
+                    return -under_share  # negate so sort ascending = most under-share first
+
+                available.sort(key=proportional_key)
+            else:
+                # 'greedy': pick whoever has the most actual free space remaining
+                available.sort(
+                    key=lambda x: x[1]['free_capacity_gb'] - node_allocated[x[0]],
+                    reverse=True,
+                )
+
             primary_id = available[0][0]
             node_allocated[primary_id] += chunk_size_gb
-            replica_candidates = [(nid, info) for nid, info in all_nodes if nid != primary_id and (info['free_capacity_gb'] - node_allocated[nid]) >= chunk_size_gb]
-            replica_candidates.sort(key=lambda x: x[1]['free_capacity_gb'] - node_allocated[x[0]], reverse=True)
+
+            # Replicas always go to whoever has the most free space (greedy),
+            # regardless of the primary strategy — this prevents any replica
+            # from landing on a node that's nearly full.
+            replica_candidates = [
+                (nid, info) for nid, info in all_nodes
+                if nid != primary_id
+                and (info['free_capacity_gb'] - node_allocated[nid]) >= chunk_size_gb
+            ]
+            replica_candidates.sort(
+                key=lambda x: x[1]['free_capacity_gb'] - node_allocated[x[0]],
+                reverse=True,
+            )
             replicas = []
             for i in range(min(replication_factor - 1, len(replica_candidates))):
                 rid = replica_candidates[i][0]
                 replicas.append(rid)
                 node_allocated[rid] += chunk_size_gb
+
             placement[chunk_idx] = {'primary': primary_id, 'replicas': replicas}
+
+        # Log distribution summary
+        primary_dist = {}
+        for p in placement.values():
+            primary_dist[p['primary']] = primary_dist.get(p['primary'], 0) + 1
+        node_names = {nid: info['node_name'] for nid, info in all_nodes}
+        named_dist = {node_names.get(k, k): v for k, v in primary_dist.items()}
+        print(f"Chunk placement ({strategy}): primaries {named_dist}")
+
         return placement
 
     async def _send_chunk_to_node(self, chunk_path, chunk_hash, size_bytes, target_node_id, file_id, chunk_index, file_metadata, is_primary=False):
@@ -2558,7 +2653,7 @@ class TossItNode:
                     if distributed:
                         _rep_factor = 2 if (1 + len(self.peer_nodes)) <= 4 else 3
                         _file_meta  = {'filename': file.filename, 'total_size_bytes': file_size, 'chunk_size_bytes': CHUNK_SIZE, 'total_chunks': chunk_index, 'checksum_sha256': file_checksum, 'uploaded_by': 'delegated' if is_delegated else 'web_user'}
-                        _placement  = self._calculate_chunk_placement(file_id=file_id, total_chunks=chunk_index, chunk_size_bytes=CHUNK_SIZE, replication_factor=_rep_factor)
+                        _placement  = self._calculate_chunk_placement(file_id=file_id, total_chunks=chunk_index, chunk_size_bytes=CHUNK_SIZE, replication_factor=_rep_factor, strategy='proportional')
                         asyncio.create_task(self._distribute_chunks_by_placement(file_id, list(chunk_meta_list), _placement, _file_meta))
                     else:
                         asyncio.create_task(self._replicate_file_chunks(file_id))
